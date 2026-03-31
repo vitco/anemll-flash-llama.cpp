@@ -13,7 +13,9 @@ Flash-MoE inference for large GGUF Mixture-of-Experts models on Apple Silicon, u
 ## Current Model Support
 
 - `Qwen3.5` GGUF MoE is the current anchor path for bring-up and regression work.
+- In this fork, Qwen `slot-bank` defaults to GPU-offloaded dense/shared execution with GPU-visible routed slot banks when `-ngl > 0`; use `-ngl 999` instead of manually counting non-MoE layers.
 - `Kimi-K2` and `Kimi-K2.5` GGUF support is experimental today: sidecar extraction, slot-bank runtime, trace capture, and bank modeling work, but quality and performance are still being tuned.
+- Kimi sidecar modes remain capped at `-ngl 0` for safety until the GPU-native routed bank path is validated there too.
 
 ## Purpose
 
@@ -132,9 +134,12 @@ build/bin/llama-cli \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen35 \
   --moe-slot-bank 128 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
-  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
+  -ub 4 -b 64 -ngl 999 -c 256 --seed 0 --temp 0 \
   -p "What is Apple Neural Engine" -n 120
 ```
+
+In `slot-bank` mode you do not need to know how many layers are routed MoE versus dense/shared.
+Routed expert tensors are virtualized out of the normal GGUF weight loader, so `-ngl 999` applies the regular offload policy to dense/shared tensors while routed expert bytes continue to come from the sidecar path.
 
 ### Kimi-K2.5 (5-shard GGUF, 217 GB sidecar)
 
@@ -162,7 +167,7 @@ python3 tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
   --sidecar ~/Models/flash/Kimi-K2.5-sidecar
 # → verified 180 Flash-MoE sidecar entries against 5 GGUF file(s)
 
-# 5. Run slot-bank inference (real SSD streaming — sidecar exceeds RAM)
+# 5. Run slot-bank inference (current Kimi safe fallback: sidecar streaming with `-ngl 0`)
 build/bin/llama-cli \
   -m ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/Kimi-K2.5-sidecar \
@@ -171,6 +176,10 @@ build/bin/llama-cli \
   -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
   -p "What is Apple Neural Engine" -n 100
 ```
+
+Kimi keeps `-ngl 0` in this fork on purpose.
+This is the current safety fallback, not the new Qwen-style default.
+Its sidecar path is working, but the GPU-native routed bank path is not yet validated there, so sidecar-mode GPU offload stays blocked to avoid unsafe memory pressure and hard freezes.
 
 ### Sidecar Directory Layout
 
@@ -217,7 +226,7 @@ python3 tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
 
 **Qwen3.5-35B-A3B-UD-IQ2_M** (256 experts/layer, k→4 via `--moe-topk`, 10.60 GiB, 2.63 BPW)
 
-### Slot-Bank Streaming (sidecar, `-ngl 0 -ub 4 -b 64 -c 256`, 120 tokens)
+### Slot-Bank Streaming (sidecar, `-ngl 99 -ub 4 -b 64 -c 256`, 120 tokens)
 
 Recommended config:
 
@@ -226,66 +235,67 @@ llama-cli -m Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen35 \
   --moe-slot-bank 128 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
-  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
-  -p "What is Apple Neural Engine" -n 120
+  -ub 4 -b 64 -ngl 99 -c 256 --seed 0 --temp 0 \
+  -p “What is Apple Neural Engine” -n 120
 ```
 
-| Bank | Decode tok/s | Hit rate | Misses/call | I/O GiB | pread ops | Notes |
-|-----:|------------:|--------:|:-----------:|--------:|----------:|-------|
-| 16 | 38.2 | 59.6% | 1.65 | 7.08 | 24,195 | High miss rate |
-| 32 | **40.3** | 73.1% | 1.10 | 4.70 | 16,077 | Good default |
-| 64 | **40.3** | 81.2% | 0.77 | 3.30 | 11,268 | Balanced |
-| **128** | **40.8** | **83.8%** | **0.66** | **2.85** | **9,729** | Recommended |
-| 256 | 39.6 | 83.8% | 0.66 | 2.84 | 9,705 | No gain over 128 |
+| Bank | Decode tok/s | Prompt tok/s | Hit rate | Misses/call | I/O GiB | pread ops |
+|-----:|------------:|-----------:|--------:|:-----------:|--------:|----------:|
+| 16 | 46.9 | 79.2 | 58.8% | 1.68 | 7.21 | 24,642 |
+| 32 | 51.9 | 75.5 | 72.8% | 1.11 | 4.77 | 16,299 |
+| 64 | **53.2** | 61.5 | 81.8% | 0.74 | 3.18 | 10,869 |
+| **128** | **53.0** | **75.5** | **84.5%** | **0.64** | **2.72** | **9,297** |
+| 256 | **55.2** | 76.0 | 84.5% | 0.63 | 2.72 | 9,291 |
 
-Temporal prefetch: 100% hit rate (0 misses / 4,880 prefetch calls) after warm-up.
+bank=64-128 is the sweet spot: 53 t/s decode at 82-85% hit rate. bank=256 squeezes out 2 more t/s but doubles resident memory. Temporal prefetch: near-100% hit after warm-up.
 
-### Critical Parameter Effects
+### Top-k Reduction (bank=128, `-ngl 99 -ub 4`)
 
-**`-ngl` (GPU layers):** `-ngl 0` is fastest for slot-bank — CPU path avoids Metal command buffer overhead for sidecar-served experts.
+| topk | Decode tok/s | Prompt tok/s | Hit % | I/O GiB | pread ops |
+|-----:|-----------:|-----------:|------:|--------:|----------:|
+| 2 | 52.0 | 59.5 | 77.9% | 1.94 | 6,630 |
+| **4** | **52.9** | **71.5** | **84.5%** | **2.72** | **9,297** |
+| 8 (default) | 42.8 | 31.2 | 86.3% | 4.79 | 16,389 |
 
-| ngl | Decode tok/s | Notes |
-|----:|------------:|-------|
-| **0** | **39.7** | Best — CPU avoids Metal overhead |
-| 10 | 37.3 | |
-| 20 | 35.5 | |
-| 40 | 35.8 | |
-| 99 | 38.8 | All on GPU |
+`--moe-topk 4` is the sweet spot — 24% faster than default k=8, with better prompt throughput. k=2 saves I/O but slightly lower hit rate.
 
-**`-ub` (ubatch size):** `-ub 4` is the sweet spot — larger ubatch increases topk resolve latency.
+### Ubatch Sweep (bank=128, `-ngl 99`)
 
 | ub | Decode tok/s | Prompt tok/s | Notes |
 |---:|------------:|------------:|-------|
-| 1 | 39.0 | 34.0 | Too small |
-| 2 | 38.0 | 37.2 | |
-| **4** | **40.1** | **45.8** | **Sweet spot** |
-| 8 | 32.3 | 45.3 | topk overhead grows |
-| 16 | 32.1 | 42.4 | |
-| 32 | 30.1 | 34.7 | Too large |
+| 1 | 55.0 | 45.2 | Best decode, slow prompt |
+| **2** | **56.7** | **61.2** | **Best decode** |
+| **4** | **54.8** | **74.3** | **Best overall balance** |
+| 8 | 54.1 | 75.3 | |
+| 16 | 52.4 | 75.6 | |
+| 32 | 50.8 | 73.7 | |
 
-### Runtime Breakdown (optimal config, bank=128)
+`-ub 2` peaks for decode (56.7 t/s), `-ub 4` is best balanced (54.8 decode + 74.3 prompt).
+
+### Runtime Breakdown (bank=128, `-ngl 99 -ub 4 --moe-topk 4`)
 
 ```
-topk resolve:    0.41 ms   (routing + softmax + top-k selection)
-slot resolve:    1.24 ms   (LRU lookup + victim selection)
-pread install: 290.52 ms   (9,729 pread ops, 2.85 GiB total)
-  source I/O:  289.14 ms   (pread from sidecar layer files)
-  slot-write:    0.21 ms   (memcpy into bank slot)
-  trace:         0.10 ms   (JSONL write)
-prefetch:        0.82 ms   (4,880 calls, 100% hit — zero I/O)
+topk resolve:    0.17 ms   (routing + softmax + top-k selection)
+slot resolve:    0.96 ms   (LRU lookup + victim selection)
+pread install: 265.55 ms   (9,297 pread ops, 2.72 GiB total)
+  source I/O:  149.01 ms   (pread from sidecar layer files)
+  GPU upload:  113.73 ms   (copy to Metal buffer)
+  slot-write:    0.11 ms
+  trace:         0.09 ms
 ```
+
+The GPU upload cost (114 ms) is new vs the old CPU-only path — but it's worth it because GPU compute on the dense path is 3-4x faster.
 
 ### Resident Modes (llama-bench, 3 reps each)
 
 | Mode | Decode tok/s | Prefill tok/s | Notes |
 |------|------------:|-------------:|-------|
-| `stock` (default GGUF) | **108.7** | 3,070 | All experts resident in GPU |
-| `--moe-mode resident` | **110.6** | — | Explicit resident flag |
-| `--moe-mode resident-bank` + sidecar | **110.0** | — | Sidecar bank override |
-| `--moe-topk 4` (k reduction 8→4) | **109.4** | — | Half the expert compute |
-| `--cpu-moe` | **111.0** | — | Experts on CPU (all cached) |
+| `stock` (default GGUF, `-ngl 99`) | **109.0** | 3,070 | All experts resident in GPU |
+| `slot-bank 128` (sidecar, `-ngl 99`) | **53.0** | 75.5 | GPU-bank, pread streaming |
 
-### Prompt Processing Scaling
+Slot-bank decode is 49% of stock — the gap is pread I/O + GPU upload for the 16% of experts that miss the bank each token.
+
+### Prompt Processing Scaling (stock, `-ngl 99`)
 
 | Batch | tok/s |
 |------:|------:|
@@ -296,7 +306,7 @@ prefetch:        0.82 ms   (4,880 calls, 100% hit — zero I/O)
 | 1024 | 3,021 |
 | 2048 | 3,000 |
 
-### Decode Scaling (resident, llama-bench)
+### Decode Scaling (stock, `-ngl 99`, llama-bench)
 
 | Tokens | tok/s |
 |-------:|------:|
@@ -305,18 +315,6 @@ prefetch:        0.82 ms   (4,880 calls, 100% hit — zero I/O)
 | 128 | 109.1 |
 | 256 | 109.3 |
 | 512 | 105.0 |
-
-### Expert Locality (120 tokens, 40 layers, k=4, trace harness)
-
-| Bank | Hit % | Misses/call | pread ops | I/O GiB |
-|-----:|------:|:-----------:|----------:|--------:|
-| 16 | 59.6% | 1.65 | 24,195 | 7.08 |
-| 32 | 73.1% | 1.10 | 16,077 | 4.70 |
-| 64 | 81.2% | 0.77 | 11,268 | 3.30 |
-| 128 | 83.8% | 0.66 | 9,729 | 2.85 |
-| 256 | 83.8% | 0.66 | 9,705 | 2.84 |
-
-bank=128 saturates hit rate for this model (k=4 of 256 experts). Larger banks add memory without improving locality.
 
 ### Perplexity — WikiText-2
 
@@ -342,7 +340,7 @@ Trace-harness mode produces coherent, detailed text (tested: RISC vs CISC archit
 
 **Kimi-K2.5-UD-TQ1_0** (256 experts/layer, 60 layers, 217 GB sidecar — real SSD streaming)
 
-### Slot-Bank Streaming (sidecar, `-ngl 0 -ub 4 -b 64 -c 256`, 100 tokens)
+### Slot-Bank Streaming (current Kimi safe fallback, `-ngl 0 -ub 4 -b 64 -c 256`, 100 tokens)
 
 ```bash
 llama-cli -m Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
@@ -396,6 +394,10 @@ prefetch:         22.1 ms total (100% hit after warm-up)
 ```
 
 SSD throughput: ~4.7 GB/s effective (Apple Fabric, 3.28 MB sequential pread). Bottleneck is pure I/O — the 217 GB sidecar exceeds the 128 GB page cache, so most experts are cold reads from NVMe.
+
+Kimi keeps this `-ngl 0` configuration on purpose in the current fork.
+Unlike Qwen, its GPU-native routed bank path is not yet validated, so `-ngl 999` is not currently a supported sidecar-mode setting there.
+This section is documenting the current safety path, not the intended future end state.
 
 ## Upstream Base
 
