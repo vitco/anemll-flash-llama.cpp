@@ -2226,6 +2226,87 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
+        {"--moe-sidecar"}, "PATH",
+        "Flash-MoE sidecar directory or manifest path used to override routed expert tensors",
+        [](common_params & params, const std::string & value) {
+            params.moe_sidecar = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SIDECAR"));
+    add_opt(common_arg(
+        {"--moe-mode"}, "{stock,resident,resident-bank,slot-bank,oracle-all-hit,oracle-prefetch}",
+        "Flash-MoE runtime mode",
+        [](common_params & params, const std::string & value) {
+            static const std::set<std::string> valid = {
+                "stock",
+                "resident",
+                "resident-bank",
+                "slot-bank",
+                "oracle-all-hit",
+                "oracle-prefetch",
+            };
+            if (!valid.count(value)) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_mode = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_MODE"));
+    add_opt(common_arg(
+        {"--moe-slot-bank"}, "N",
+        "Flash-MoE slot-bank resident expert capacity per routed MoE layer",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_slot_bank = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_BANK"));
+    add_opt(common_arg(
+        {"--moe-topk"}, "N",
+        "experimental runtime reduction-only override for routed experts per token (0 = model metadata, must be <= GGUF MoE top-k)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_topk_override = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_TOPK"));
+    add_opt(common_arg(
+        {"--moe-prefetch-temporal"},
+        {"--no-moe-prefetch-temporal"},
+        string_format("enable real runtime one-step temporal prefetch on top of Flash-MoE slot-bank mode (default: %s)", params.moe_prefetch_temporal ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_prefetch_temporal = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_TEMPORAL"));
+    add_opt(common_arg(
+        {"--moe-trace-harness"},
+        "llama-cli only: bypass the chat loop and run the provided --prompt as a raw non-interactive completion for long Flash-MoE trace collection",
+        [](common_params & params) {
+            params.moe_trace_harness = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MOE_TRACE_HARNESS"));
+    add_opt(common_arg(
+        {"--moe-trace"}, "FILE",
+        "Flash-MoE trace output path, or replay input path for oracle-all-hit/oracle-prefetch",
+        [](common_params & params, const std::string & value) {
+            params.moe_trace = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_TRACE"));
+    add_opt(common_arg(
+        {"--moe-quant-map"}, "FILE",
+        "Flash-MoE dynamic-quant policy file reserved for future bank selection work",
+        [](common_params & params, const std::string & value) {
+            params.moe_quant_map = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_QUANT_MAP"));
+    add_opt(common_arg(
+        {"--moe-verify-sidecar"},
+        "validate Flash-MoE sidecar metadata parity during model load",
+        [](common_params & params) {
+            params.moe_verify_sidecar = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_VERIFY_SIDECAR"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

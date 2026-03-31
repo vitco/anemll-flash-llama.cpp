@@ -47,6 +47,9 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        llama_tensor_weight(uint16_t idx, size_t offs, ggml_tensor * tensor) : idx(idx), offs(offs), tensor(tensor) {
+        }
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -111,6 +114,7 @@ struct llama_model_loader {
     };
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map_virtual;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
@@ -130,7 +134,9 @@ struct llama_model_loader {
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const char * moe_sidecar_path = nullptr,
+        bool moe_verify_sidecar = false);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
@@ -181,6 +187,10 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    struct ggml_tensor * create_tensor_virtual(
+        const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::vector<int64_t> & ne, int flags);
+
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 
     void done_getting_tensors() const;
@@ -199,6 +209,8 @@ struct llama_model_loader {
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
+
+    void apply_moe_sidecar_overrides(const std::string & path, bool verify_sidecar);
 
     std::string ftype_name() const;
 

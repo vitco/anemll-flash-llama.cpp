@@ -1,4 +1,406 @@
-# llama.cpp
+# anemll-flash-llama.cpp
+
+Flash-MoE inference for large GGUF Mixture-of-Experts models on Apple Silicon, using `llama.cpp`.
+
+> This repo stays close to upstream `ggml-org/llama.cpp`, but adds sidecar-backed routed expert loading, streamed slot-bank execution, trace capture, oracle replay, and bank-modeling tools for Flash-MoE workflows.
+>
+> Flash-MoE-specific guide: [tools/flashmoe-sidecar/README.md](./tools/flashmoe-sidecar/README.md)
+>
+> Flash-MoE bank-modeling workflow: [docs/moe-bank-modeling-workflow.md](./docs/moe-bank-modeling-workflow.md)
+>
+> Native slot-bank model-porting guide: [docs/native-slot-bank-porting.md](./docs/native-slot-bank-porting.md)
+
+## Current Model Support
+
+- `Qwen3.5` GGUF MoE is the current anchor path for bring-up and regression work.
+- `Kimi-K2` and `Kimi-K2.5` GGUF support is experimental today: sidecar extraction, slot-bank runtime, trace capture, and bank modeling work, but quality and performance are still being tuned.
+
+## Purpose
+
+Flash-MoE is not mainly about SSD reads.
+It is about changing the boundary between dense execution, expert storage, expert selection, and expert consumption.
+
+The dense path should stay inside the backend that is already good at it.
+The sparse path should be reshaped around a stable bank or slot-bank plus ids-as-data.
+
+By "banking" we mean this: instead of treating every routed expert as a fresh tensor object that has to be materialized on demand, the runtime keeps a small resident execution surface per layer, made of stable slots. A routed `expert_id` is first resolved to a resident `slot_id`; if the expert is already there, execution is just an indexed hit, and if not, the runtime loads the expert bytes and commits them into a victim slot before use. The important part is that the execution shape stays stable while expert identity changes, which is much cheaper than rebuilding a tiny K-expert bank every token.
+
+## The Big Lesson
+
+A stable bank with changing ids is fast.
+Per-token K-expert materialization is slow.
+
+The expensive part is not dynamic routing by itself. The expensive part is forcing the runtime to keep rebuilding selected experts in the hot path. Once that boundary is moved, a streamed slot-bank becomes the first realistic external-expert shape. Miss path and hit path become different problems. Oracle ceilings become mandatory, because they tell you whether the next bottleneck is consume, commit, or prefetch.
+
+## Reusable Workflow
+
+This is the workflow to reuse across backends:
+
+1. Measure the normal resident baseline.
+2. Build a resident packed-bank path.
+3. Prove that changing ids is cheap on that good path.
+4. Add one intentionally bad K-materialization diagnostic.
+5. Build a real streamed slot-bank.
+6. Measure locality before designing cache policy.
+7. Build oracle all-hit replay and one-step oracle prefetch replay.
+8. Decide whether the next work belongs in the hit path or the miss path.
+9. Only then move more of the boundary into native consume if backend-level slot-bank work stalls.
+
+## What Matters Most
+
+Stable bank or slot plus ids is the first shape to try.
+Per-token K-expert materialization is useful as a diagnostic, but usually the wrong product shape.
+Hit path and miss path are different bottlenecks.
+Early slot-bank numbers are rungs, not ceilings.
+And native code only matters if the execution boundary really moves.
+
+## Flash-MoE Additions In This Fork
+
+- `--moe-sidecar` to attach a routed-expert sidecar manifest or bank directory
+- `--moe-mode stock|resident|resident-bank|slot-bank|oracle-all-hit|oracle-prefetch`
+- `--moe-slot-bank` for streamed resident slot capacity per routed MoE layer
+- `--moe-topk` for an experimental reduction-only routed expert override
+- `--moe-prefetch-temporal` for runtime one-step temporal prefetch on top of `slot-bank`
+- `--moe-trace-harness` for long non-interactive raw trace runs from `llama-cli`
+- `--moe-trace` and `--moe-verify-sidecar` for replay and validation workflows
+- sidecar extract / inspect / verify tooling under [`tools/flashmoe-sidecar/`](./tools/flashmoe-sidecar/)
+
+## How It Works: Dense + Experts Split
+
+A Mixture-of-Experts model has two kinds of weights:
+
+1. **Dense weights** — attention, norms, embedding, LM head, shared experts. These are small, used on every token, and stay resident in memory. In a GGUF file these are the non-`_exps` tensors.
+
+2. **Routed expert weights** — gate, up, and down projections for each of the N experts per layer. These are large (often 90%+ of total model size) but only K of N are activated per token. In a GGUF these are `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`.
+
+In **stock mode**, `llama.cpp` loads everything into one memory space — dense and experts together. This works when the model fits in RAM.
+
+In **slot-bank mode**, the runtime splits execution:
+
+- The **GGUF file** provides dense weights (loaded normally via mmap)
+- A **sidecar directory** provides routed expert weights as separate per-layer binary files, streamed from SSD on demand via `pread()`
+
+```
+GGUF file (dense)              Sidecar directory (experts)
+┌─────────────────────┐        ┌─────────────────────────┐
+│ attention Q/K/V/O   │        │ layer_000.bin  (3 tensors: gate + up + down)
+│ norms, embedding    │        │ layer_001.bin
+│ LM head             │        │ ...
+│ shared experts      │        │ layer_059.bin
+│ routing gates       │        │ manifest.json
+└─────────────────────┘        └─────────────────────────┘
+       ~5-30 GB                      ~9 GB (35B) / ~217 GB (K2.5)
+    always in memory               streamed from SSD per token
+```
+
+The sidecar is created by extracting routed expert tensors from the GGUF into separate files. The `manifest.json` maps tensor names to byte offsets within each layer file, preserving the original quantization format. At runtime, only the K active experts per layer are read from disk — not all N.
+
+This split is what makes it possible to run models whose expert weights exceed available RAM. The dense weights stay resident while the slot-bank runtime manages a small cache of recently-used experts, evicting and loading as routing decisions change.
+
+## Quick Start: Sidecar Extraction
+
+### Qwen3.5-35B-A3B (single GGUF, 9 GB sidecar)
+
+```bash
+# 1. Download model
+huggingface-cli download unsloth/Qwen3.5-35B-A3B-GGUF \
+  --include "Qwen3.5-35B-A3B-UD-IQ2_M.gguf" \
+  --local-dir ~/Models
+
+# 2. Inspect routed expert tensors
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py inspect \
+  --model ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf
+# → 40 layers, 120 tensors, 9.0 GB (ffn_gate_exps + ffn_up_exps + ffn_down_exps)
+
+# 3. Extract sidecar (all routed experts)
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  --out-dir ~/Models/flash/qwen35 \
+  --force
+# → wrote 120 tensors across 40 layers (9.0 GB)
+# → manifest: ~/Models/flash/qwen35/manifest.json
+
+# 4. Verify byte-level integrity
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
+  --model ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  --sidecar ~/Models/flash/qwen35
+# → verified 120 Flash-MoE sidecar entries against 1 GGUF file(s)
+
+# 5. Run slot-bank inference
+build/bin/llama-cli \
+  -m ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen35 \
+  --moe-slot-bank 128 --moe-topk 4 --moe-prefetch-temporal \
+  --moe-trace-harness --no-warmup \
+  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
+  -p "What is Apple Neural Engine" -n 120
+```
+
+### Kimi-K2.5 (5-shard GGUF, 217 GB sidecar)
+
+```bash
+# 1. Download model (5 shards, ~250 GB total)
+huggingface-cli download moonshotai/Kimi-K2.5-GGUF \
+  --include "Kimi-K2.5-UD-TQ1_0-*.gguf" \
+  --local-dir ~/Models/Kimi
+
+# 2. Inspect — pass the first shard, tool auto-discovers all 5
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py inspect \
+  --model ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf
+# → 60 layers, 180 tensors, 217 GB (deepseek2 arch, 256 experts/layer)
+
+# 3. Extract sidecar (all routed experts, ~20 min)
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
+  --out-dir ~/Models/flash/Kimi-K2.5-sidecar \
+  --force
+# → wrote 180 tensors across 60 layers (217 GB)
+
+# 4. Verify
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
+  --model ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
+  --sidecar ~/Models/flash/Kimi-K2.5-sidecar
+# → verified 180 Flash-MoE sidecar entries against 5 GGUF file(s)
+
+# 5. Run slot-bank inference (real SSD streaming — sidecar exceeds RAM)
+build/bin/llama-cli \
+  -m ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
+  --moe-mode slot-bank --moe-sidecar ~/Models/flash/Kimi-K2.5-sidecar \
+  --moe-slot-bank 64 --moe-topk 4 --moe-prefetch-temporal \
+  --moe-trace-harness --no-warmup \
+  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
+  -p "What is Apple Neural Engine" -n 100
+```
+
+### Sidecar Directory Layout
+
+After extraction:
+
+```
+~/Models/flash/qwen35/
+  manifest.json          # tensor map: names, shapes, quant types, offsets
+  layer_000.bin          # all routed expert tensors for layer 0
+  layer_001.bin          # ...
+  ...
+  layer_039.bin          # layer 39
+
+~/Models/flash/Kimi-K2.5-sidecar/
+  manifest.json
+  layer_001.bin          # Kimi starts routed MoE at layer 1
+  ...
+  layer_060.bin
+```
+
+### Optional: Partial Extraction
+
+```bash
+# Extract only layers 0-4 (quick test)
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  --out-dir /tmp/qwen35-partial \
+  --layers 0-4 --force
+
+# Extract only gate/up experts (skip down_proj)
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  --out-dir /tmp/qwen35-gateup \
+  --families ffn_gate_exps,ffn_up_exps --force
+
+# Include shared experts alongside routed
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
+  --out-dir ~/Models/flash/Kimi-K2.5-with-shared \
+  --include-shared --force
+```
+
+## Benchmarks — M5 Max 128 GB
+
+**Qwen3.5-35B-A3B-UD-IQ2_M** (256 experts/layer, k→4 via `--moe-topk`, 10.60 GiB, 2.63 BPW)
+
+### Slot-Bank Streaming (sidecar, `-ngl 0 -ub 4 -b 64 -c 256`, 120 tokens)
+
+Recommended config:
+
+```bash
+llama-cli -m Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen35 \
+  --moe-slot-bank 128 --moe-topk 4 --moe-prefetch-temporal \
+  --moe-trace-harness --no-warmup \
+  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
+  -p "What is Apple Neural Engine" -n 120
+```
+
+| Bank | Decode tok/s | Hit rate | Misses/call | I/O GiB | pread ops | Notes |
+|-----:|------------:|--------:|:-----------:|--------:|----------:|-------|
+| 16 | 38.2 | 59.6% | 1.65 | 7.08 | 24,195 | High miss rate |
+| 32 | **40.3** | 73.1% | 1.10 | 4.70 | 16,077 | Good default |
+| 64 | **40.3** | 81.2% | 0.77 | 3.30 | 11,268 | Balanced |
+| **128** | **40.8** | **83.8%** | **0.66** | **2.85** | **9,729** | Recommended |
+| 256 | 39.6 | 83.8% | 0.66 | 2.84 | 9,705 | No gain over 128 |
+
+Temporal prefetch: 100% hit rate (0 misses / 4,880 prefetch calls) after warm-up.
+
+### Critical Parameter Effects
+
+**`-ngl` (GPU layers):** `-ngl 0` is fastest for slot-bank — CPU path avoids Metal command buffer overhead for sidecar-served experts.
+
+| ngl | Decode tok/s | Notes |
+|----:|------------:|-------|
+| **0** | **39.7** | Best — CPU avoids Metal overhead |
+| 10 | 37.3 | |
+| 20 | 35.5 | |
+| 40 | 35.8 | |
+| 99 | 38.8 | All on GPU |
+
+**`-ub` (ubatch size):** `-ub 4` is the sweet spot — larger ubatch increases topk resolve latency.
+
+| ub | Decode tok/s | Prompt tok/s | Notes |
+|---:|------------:|------------:|-------|
+| 1 | 39.0 | 34.0 | Too small |
+| 2 | 38.0 | 37.2 | |
+| **4** | **40.1** | **45.8** | **Sweet spot** |
+| 8 | 32.3 | 45.3 | topk overhead grows |
+| 16 | 32.1 | 42.4 | |
+| 32 | 30.1 | 34.7 | Too large |
+
+### Runtime Breakdown (optimal config, bank=128)
+
+```
+topk resolve:    0.41 ms   (routing + softmax + top-k selection)
+slot resolve:    1.24 ms   (LRU lookup + victim selection)
+pread install: 290.52 ms   (9,729 pread ops, 2.85 GiB total)
+  source I/O:  289.14 ms   (pread from sidecar layer files)
+  slot-write:    0.21 ms   (memcpy into bank slot)
+  trace:         0.10 ms   (JSONL write)
+prefetch:        0.82 ms   (4,880 calls, 100% hit — zero I/O)
+```
+
+### Resident Modes (llama-bench, 3 reps each)
+
+| Mode | Decode tok/s | Prefill tok/s | Notes |
+|------|------------:|-------------:|-------|
+| `stock` (default GGUF) | **108.7** | 3,070 | All experts resident in GPU |
+| `--moe-mode resident` | **110.6** | — | Explicit resident flag |
+| `--moe-mode resident-bank` + sidecar | **110.0** | — | Sidecar bank override |
+| `--moe-topk 4` (k reduction 8→4) | **109.4** | — | Half the expert compute |
+| `--cpu-moe` | **111.0** | — | Experts on CPU (all cached) |
+
+### Prompt Processing Scaling
+
+| Batch | tok/s |
+|------:|------:|
+| 1 | 97 |
+| 128 | 1,955 |
+| 256 | 2,567 |
+| 512 | 2,997 |
+| 1024 | 3,021 |
+| 2048 | 3,000 |
+
+### Decode Scaling (resident, llama-bench)
+
+| Tokens | tok/s |
+|-------:|------:|
+| 32 | 108.3 |
+| 64 | 108.9 |
+| 128 | 109.1 |
+| 256 | 109.3 |
+| 512 | 105.0 |
+
+### Expert Locality (120 tokens, 40 layers, k=4, trace harness)
+
+| Bank | Hit % | Misses/call | pread ops | I/O GiB |
+|-----:|------:|:-----------:|----------:|--------:|
+| 16 | 59.6% | 1.65 | 24,195 | 7.08 |
+| 32 | 73.1% | 1.10 | 16,077 | 4.70 |
+| 64 | 81.2% | 0.77 | 11,268 | 3.30 |
+| 128 | 83.8% | 0.66 | 9,729 | 2.85 |
+| 256 | 83.8% | 0.66 | 9,705 | 2.84 |
+
+bank=128 saturates hit rate for this model (k=4 of 256 experts). Larger banks add memory without improving locality.
+
+### Perplexity — WikiText-2
+
+| Quant | PPL | BPW | Size |
+|-------|----:|----:|-----:|
+| IQ2_M | ~9.97 | 2.63 | 10.60 GiB |
+
+Context 4352, stride 512, 4 chunks. IQ2_M is a streaming/speed test quant — quality targets require Q4_K_M or higher.
+
+### Generation Quality
+
+Trace-harness mode produces coherent, detailed text (tested: RISC vs CISC architecture explanation, Apple Neural Engine description). `llama-simple` produces degenerate output due to sampler chain differences.
+
+### Sidecar Tooling
+
+| Tool | Test | Result |
+|------|------|--------|
+| `flashmoe_sidecar.py inspect` | 40 layers, 120 expert tensors | PASS |
+| `flashmoe_sidecar.py extract` | 40 layers → 120 tensors (9.0 GB) | PASS |
+| `flashmoe_sidecar.py verify` | metadata + byte-level check | PASS (9/9) |
+
+## Benchmarks — Kimi-K2.5 (M5 Max 128 GB)
+
+**Kimi-K2.5-UD-TQ1_0** (256 experts/layer, 60 layers, 217 GB sidecar — real SSD streaming)
+
+### Slot-Bank Streaming (sidecar, `-ngl 0 -ub 4 -b 64 -c 256`, 100 tokens)
+
+```bash
+llama-cli -m Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
+  --moe-mode slot-bank --moe-sidecar ~/Models/flash/Kimi-K2.5-sidecar \
+  --moe-slot-bank 64 --moe-topk 4 --moe-prefetch-temporal \
+  --moe-trace-harness --no-warmup \
+  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
+  -p "What is Apple Neural Engine" -n 100
+```
+
+| Bank | Decode tok/s | Hit rate | Misses/call | I/O GiB | pread ops |
+|-----:|------------:|--------:|:-----------:|--------:|----------:|
+| 16 | 3.2 | 55.6% | 1.82 | 107.0 | 33,435 |
+| 32 | 3.2 | 64.1% | 1.47 | 86.2 | 27,012 |
+| **64** | **3.3** | **73.7%** | **1.08** | **62.8** | **19,755** |
+| 128 | 3.2 | 76.4% | 0.97 | 56.2 | 17,781 |
+| 256 | 3.2 | 76.4% | 0.97 | 56.2 | 17,781 |
+
+bank=64 is the best balance for Kimi K2.5. Hit rate saturates at bank=128 (76.4%).
+
+Temporal prefetch: 100% hit (10 cold misses / 6,120 calls). Prefetch I/O: 0.11 GiB — near-zero overhead.
+
+### Top-k Reduction (bank=64, prefetch-temporal)
+
+| topk | Decode tok/s | Hit % | I/O GiB | pread ops |
+|-----:|-----------:|------:|--------:|----------:|
+| 2 | **4.7** | 67.6% | 38.3 | 12,192 |
+| **4** | **3.3** | **73.7%** | **62.8** | **19,755** |
+| 8 (default) | 2.2 | 67.2% | 157.9 | 49,266 |
+
+`--moe-topk 4` halves I/O vs default k=8 while maintaining generation quality. `--moe-topk 2` is 43% faster but may degrade output for complex tasks.
+
+### Generation Quality
+
+Coherent, factually accurate output at k=4:
+
+> Apple Neural Engine (ANE) is a specialized hardware component that is designed to accelerate machine learning tasks on Apple devices. It is integrated into Apple's A-series and M-series processors, which power iPhones, iPads, and Macs. The ANE is specifically designed to handle machine learning tasks such as image recognition, natural language processing, and augmented reality.
+
+### Runtime Breakdown (bank=64, topk=4)
+
+```
+Model:    Kimi-K2.5, 60 layers, 256 experts/layer, sidecar 217 GB
+Experts:  3.28 MB each (TQ1_0)
+Per-token: ~k×60 = 240 expert loads on miss, ~3.3 MB × 240 = ~790 MB/tok worst case
+
+topk resolve:      1.89 ms
+slot resolve:      2.40 ms
+pread install: 13,852 ms total (19,755 ops, 62.8 GiB)
+  per pread:       0.70 ms avg (3.28 MB per read, ~4.7 GB/s effective)
+prefetch:         22.1 ms total (100% hit after warm-up)
+```
+
+SSD throughput: ~4.7 GB/s effective (Apple Fabric, 3.28 MB sequential pread). Bottleneck is pure I/O — the 217 GB sidecar exceeds the 128 GB page cache, so most experts are cold reads from NVMe.
+
+## Upstream Base
+
+This is still `llama.cpp`.
+The goal is a fork you can rebase from upstream while keeping the Flash-MoE patch surface small and explicit.
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 

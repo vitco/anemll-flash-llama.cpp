@@ -339,6 +339,13 @@ struct cmd_params {
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
     std::vector<bool>                use_mmap;
     std::vector<bool>                use_direct_io;
+    std::vector<std::string>         moe_sidecar;
+    std::vector<std::string>         moe_mode;
+    std::vector<std::string>         moe_trace;
+    std::vector<int>                 moe_slot_bank;
+    std::vector<int>                 moe_topk;
+    std::vector<bool>                moe_prefetch_temporal;
+    std::vector<bool>                moe_verify_sidecar;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
@@ -381,6 +388,13 @@ static const cmd_params cmd_params_defaults = {
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
     /* use_mmap             */ { true },
     /* use_direct_io        */ { false },
+    /* moe_sidecar          */ { "" },
+    /* moe_mode             */ { "stock" },
+    /* moe_trace            */ { "" },
+    /* moe_slot_bank        */ { 0 },
+    /* moe_topk             */ { 0 },
+    /* moe_prefetch_temporal*/ { false },
+    /* moe_verify_sidecar   */ { false },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
@@ -445,6 +459,13 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -dev, --device <dev0/dev1/...>              (default: auto)\n");
     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -dio, --direct-io <0|1>                     (default: %s)\n", join(cmd_params_defaults.use_direct_io, ",").c_str());
+    printf("  --moe-sidecar <path>                        (default: disabled)\n");
+    printf("  --moe-mode <stock|resident|resident-bank|slot-bank|oracle-all-hit|oracle-prefetch>   (default: %s)\n", join(cmd_params_defaults.moe_mode, ",").c_str());
+    printf("  --moe-trace <path>                             (default: disabled)\n");
+    printf("  --moe-slot-bank <n>                         (default: %s)\n", join(cmd_params_defaults.moe_slot_bank, ",").c_str());
+    printf("  --moe-topk <n>                              (default: %s)\n", join(cmd_params_defaults.moe_topk, ",").c_str());
+    printf("  --moe-prefetch-temporal <0|1>              (default: %s)\n", join(cmd_params_defaults.moe_prefetch_temporal, ",").c_str());
+    printf("  --moe-verify-sidecar                        validate sidecar metadata parity during load\n");
     printf("  -embd, --embeddings <0|1>                   (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>            (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
@@ -797,6 +818,78 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.use_direct_io.insert(params.use_direct_io.end(), p.begin(), p.end());
+            } else if (arg == "--moe-sidecar") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.moe_sidecar.insert(params.moe_sidecar.end(), p.begin(), p.end());
+            } else if (arg == "--moe-mode") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                static const std::unordered_set<std::string> valid = { "stock", "resident", "resident-bank", "slot-bank", "oracle-all-hit", "oracle-prefetch" };
+                for (const auto & mode : p) {
+                    if (!valid.count(mode)) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.moe_mode.insert(params.moe_mode.end(), p.begin(), p.end());
+            } else if (arg == "--moe-trace") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.moe_trace.insert(params.moe_trace.end(), p.begin(), p.end());
+            } else if (arg == "--moe-slot-bank") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<int>(argv[i], split_delim);
+                for (const auto slot_bank : p) {
+                    if (slot_bank < 0) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.moe_slot_bank.insert(params.moe_slot_bank.end(), p.begin(), p.end());
+            } else if (arg == "--moe-topk") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<int>(argv[i], split_delim);
+                for (const auto moe_topk : p) {
+                    if (moe_topk < 0) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.moe_topk.insert(params.moe_topk.end(), p.begin(), p.end());
+            } else if (arg == "--moe-prefetch-temporal") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.moe_prefetch_temporal.insert(params.moe_prefetch_temporal.end(), p.begin(), p.end());
+            } else if (arg == "--moe-verify-sidecar") {
+                params.moe_verify_sidecar.push_back(true);
             } else if (arg == "-embd" || arg == "--embeddings") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1083,6 +1176,27 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.no_host.empty()) {
         params.no_host = cmd_params_defaults.no_host;
     }
+    if (params.moe_sidecar.empty()) {
+        params.moe_sidecar = cmd_params_defaults.moe_sidecar;
+    }
+    if (params.moe_mode.empty()) {
+        params.moe_mode = cmd_params_defaults.moe_mode;
+    }
+    if (params.moe_trace.empty()) {
+        params.moe_trace = cmd_params_defaults.moe_trace;
+    }
+    if (params.moe_slot_bank.empty()) {
+        params.moe_slot_bank = cmd_params_defaults.moe_slot_bank;
+    }
+    if (params.moe_topk.empty()) {
+        params.moe_topk = cmd_params_defaults.moe_topk;
+    }
+    if (params.moe_prefetch_temporal.empty()) {
+        params.moe_prefetch_temporal = cmd_params_defaults.moe_prefetch_temporal;
+    }
+    if (params.moe_verify_sidecar.empty()) {
+        params.moe_verify_sidecar = cmd_params_defaults.moe_verify_sidecar;
+    }
     if (params.n_threads.empty()) {
         params.n_threads = cmd_params_defaults.n_threads;
     }
@@ -1123,6 +1237,13 @@ struct cmd_params_instance {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool               use_mmap;
     bool               use_direct_io;
+    std::string        moe_sidecar;
+    std::string        moe_mode;
+    std::string        moe_trace;
+    int                moe_slot_bank;
+    int                moe_topk;
+    bool               moe_prefetch_temporal;
+    bool               moe_verify_sidecar;
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
@@ -1139,6 +1260,13 @@ struct cmd_params_instance {
         mparams.tensor_split  = tensor_split.data();
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
+        mparams.moe_sidecar_path = moe_sidecar.empty() ? nullptr : moe_sidecar.c_str();
+        mparams.moe_mode         = moe_mode.empty() ? nullptr : moe_mode.c_str();
+        mparams.moe_trace_file   = moe_trace.empty() ? nullptr : moe_trace.c_str();
+        mparams.moe_slot_bank    = moe_slot_bank;
+        mparams.moe_topk_override = moe_topk;
+        mparams.moe_prefetch_temporal = moe_prefetch_temporal;
+        mparams.moe_verify_sidecar = moe_verify_sidecar;
         mparams.no_host       = no_host;
 
         if (n_cpu_moe <= 0) {
@@ -1185,6 +1313,10 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
+               moe_sidecar == other.moe_sidecar && moe_mode == other.moe_mode && moe_trace == other.moe_trace &&
+               moe_slot_bank == other.moe_slot_bank && moe_topk == other.moe_topk &&
+               moe_prefetch_temporal == other.moe_prefetch_temporal &&
+               moe_verify_sidecar == other.moe_verify_sidecar &&
                devices == other.devices &&
                no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
@@ -1223,6 +1355,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & ot : params.tensor_buft_overrides)
     for (const auto & mmp : params.use_mmap)
     for (const auto & dio : params.use_direct_io)
+    for (const auto & ms : params.moe_sidecar)
+    for (const auto & mm : params.moe_mode)
+    for (const auto & mt : params.moe_trace)
+    for (const auto & msb : params.moe_slot_bank)
+    for (const auto & mtk : params.moe_topk)
+    for (const auto & mpt : params.moe_prefetch_temporal)
+    for (const auto & mvs : params.moe_verify_sidecar)
     for (const auto & noh : params.no_host)
     for (const auto & embd : params.embeddings)
     for (const auto & nopo : params.no_op_offload)
@@ -1265,6 +1404,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
+                /* .moe_sidecar  = */ ms,
+                /* .moe_mode     = */ mm,
+                /* .moe_trace    = */ mt,
+                /* .moe_slot_bank = */ msb,
+                /* .moe_topk     = */ mtk,
+                /* .moe_prefetch_temporal = */ mpt,
+                /* .moe_verify_sidecar = */ mvs,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
@@ -1300,6 +1446,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
+                /* .moe_sidecar  = */ ms,
+                /* .moe_mode     = */ mm,
+                /* .moe_trace    = */ mt,
+                /* .moe_slot_bank = */ msb,
+                /* .moe_topk     = */ mtk,
+                /* .moe_prefetch_temporal = */ mpt,
+                /* .moe_verify_sidecar = */ mvs,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
@@ -1335,6 +1488,13 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
+                /* .moe_sidecar  = */ ms,
+                /* .moe_mode     = */ mm,
+                /* .moe_trace    = */ mt,
+                /* .moe_slot_bank = */ msb,
+                /* .moe_topk     = */ mtk,
+                /* .moe_prefetch_temporal = */ mpt,
+                /* .moe_verify_sidecar = */ mvs,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
@@ -1375,6 +1535,13 @@ struct test {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool                     use_mmap;
     bool                     use_direct_io;
+    std::string              moe_sidecar;
+    std::string              moe_mode;
+    std::string              moe_trace;
+    int                      moe_slot_bank;
+    int                      moe_topk;
+    bool                     moe_prefetch_temporal;
+    bool                     moe_verify_sidecar;
     bool                     embeddings;
     bool                     no_op_offload;
     bool                     no_host;
@@ -1413,6 +1580,13 @@ struct test {
         tensor_buft_overrides = inst.tensor_buft_overrides;
         use_mmap       = inst.use_mmap;
         use_direct_io  = inst.use_direct_io;
+        moe_sidecar    = inst.moe_sidecar;
+        moe_mode       = inst.moe_mode;
+        moe_trace      = inst.moe_trace;
+        moe_slot_bank  = inst.moe_slot_bank;
+        moe_topk       = inst.moe_topk;
+        moe_prefetch_temporal = inst.moe_prefetch_temporal;
+        moe_verify_sidecar = inst.moe_verify_sidecar;
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
         no_host        = inst.no_host;
@@ -1472,7 +1646,8 @@ struct test {
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
-            "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
+            "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "moe_sidecar",
+            "moe_mode",       "moe_trace",      "moe_slot_bank", "moe_topk", "moe_prefetch_temporal", "moe_verify_sidecar",             "embeddings",
             "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1485,11 +1660,13 @@ struct test {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
+            field == "moe_slot_bank" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
+            field == "use_mmap" || field == "use_direct_io" || field == "moe_prefetch_temporal" || field == "moe_verify_sidecar" ||
+            field == "embeddings" || field == "no_host") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1563,6 +1740,13 @@ struct test {
                                             tensor_buft_overrides_str,
                                             std::to_string(use_mmap),
                                             std::to_string(use_direct_io),
+                                            moe_sidecar.empty() ? "none" : moe_sidecar,
+                                            moe_mode,
+                                            moe_trace.empty() ? "none" : moe_trace,
+                                            std::to_string(moe_slot_bank),
+                                            std::to_string(moe_topk),
+                                            std::to_string(moe_prefetch_temporal),
+                                            std::to_string(moe_verify_sidecar),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
@@ -1751,6 +1935,12 @@ struct markdown_printer : public printer {
         if (field == "use_direct_io") {
             return 3;
         }
+        if (field == "moe_slot_bank") {
+            return 5;
+        }
+        if (field == "moe_topk") {
+            return 5;
+        }
         if (field == "test") {
             return 15;
         }
@@ -1790,6 +1980,27 @@ struct markdown_printer : public printer {
         }
         if (field == "use_direct_io") {
             return "dio";
+        }
+        if (field == "moe_sidecar") {
+            return "mside";
+        }
+        if (field == "moe_mode") {
+            return "mmode";
+        }
+        if (field == "moe_trace") {
+            return "mtrace";
+        }
+        if (field == "moe_slot_bank") {
+            return "mslot";
+        }
+        if (field == "moe_topk") {
+            return "mtopk";
+        }
+        if (field == "moe_prefetch_temporal") {
+            return "mpref";
+        }
+        if (field == "moe_verify_sidecar") {
+            return "mver";
         }
         if (field == "embeddings") {
             return "embd";
@@ -1877,6 +2088,27 @@ struct markdown_printer : public printer {
         }
         if (params.use_direct_io.size() > 1 || params.use_direct_io != cmd_params_defaults.use_direct_io) {
             fields.emplace_back("use_direct_io");
+        }
+        if (params.moe_sidecar.size() > 1 || params.moe_sidecar != cmd_params_defaults.moe_sidecar) {
+            fields.emplace_back("moe_sidecar");
+        }
+        if (params.moe_mode.size() > 1 || params.moe_mode != cmd_params_defaults.moe_mode) {
+            fields.emplace_back("moe_mode");
+        }
+        if (params.moe_trace.size() > 1 || params.moe_trace != cmd_params_defaults.moe_trace) {
+            fields.emplace_back("moe_trace");
+        }
+        if (params.moe_slot_bank.size() > 1 || params.moe_slot_bank != cmd_params_defaults.moe_slot_bank) {
+            fields.emplace_back("moe_slot_bank");
+        }
+        if (params.moe_topk.size() > 1 || params.moe_topk != cmd_params_defaults.moe_topk) {
+            fields.emplace_back("moe_topk");
+        }
+        if (params.moe_prefetch_temporal.size() > 1 || params.moe_prefetch_temporal != cmd_params_defaults.moe_prefetch_temporal) {
+            fields.emplace_back("moe_prefetch_temporal");
+        }
+        if (params.moe_verify_sidecar.size() > 1 || params.moe_verify_sidecar != cmd_params_defaults.moe_verify_sidecar) {
+            fields.emplace_back("moe_verify_sidecar");
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");

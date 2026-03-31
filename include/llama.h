@@ -288,6 +288,19 @@ extern "C" {
         // NULL-terminated list of buffer types to use for tensors that match a pattern
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
+        // Optional Flash-MoE sidecar directory or manifest path used to override routed expert tensors.
+        const char * moe_sidecar_path;
+
+        // Optional Flash-MoE execution mode.
+        // Supported in this build: "stock", "resident", "resident-bank", "slot-bank", "oracle-all-hit", "oracle-prefetch".
+        const char * moe_mode;
+
+        // Slot-bank trace output path, or replay input path for oracle-all-hit / oracle-prefetch.
+        const char * moe_trace_file;
+
+        // Optional dynamic-quant policy file reserved for future bank selection work.
+        const char * moe_quant_map;
+
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 
@@ -317,6 +330,11 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool moe_verify_sidecar; // validate sidecar metadata parity during model load
+        bool moe_prefetch_temporal; // real runtime one-step temporal prefetch on top of slot-bank mode
+
+        int32_t moe_slot_bank; // slot-bank resident expert capacity per routed MoE layer
+        int32_t moe_topk_override; // runtime reduction-only override for routed experts per token (0 = model metadata)
     };
 
     struct llama_sampler_seq_config {

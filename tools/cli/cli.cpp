@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <thread>
 #include <signal.h>
 
@@ -80,47 +81,61 @@ struct cli_context {
     }
 
     std::string generate_completion(result_timings & out_timings) {
+        return generate_completion_impl(out_timings, std::nullopt);
+    }
+
+    std::string generate_raw_completion(const std::string & prompt, result_timings & out_timings) {
+        return generate_completion_impl(out_timings, prompt);
+    }
+
+private:
+    std::string generate_completion_impl(result_timings & out_timings, const std::optional<std::string> & raw_prompt) {
         server_response_reader rd = ctx_server.get_response_reader();
-        auto chat_params = format_chat();
+        common_chat_params chat_params;
+        if (!raw_prompt.has_value()) {
+            chat_params = format_chat();
+        }
         {
             // TODO: reduce some copies here in the future
             server_task task = server_task(SERVER_TASK_TYPE_COMPLETION);
             task.id         = rd.get_new_id();
             task.index      = 0;
             task.params     = defaults;           // copy
-            task.cli_prompt = chat_params.prompt; // copy
+            task.cli_prompt = raw_prompt.has_value() ? *raw_prompt : chat_params.prompt; // copy
             task.cli_files  = input_files;        // copy
             task.cli        = true;
 
-            // chat template settings
-            task.params.chat_parser_params = common_chat_parser_params(chat_params);
-            task.params.chat_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
-            if (!chat_params.parser.empty()) {
-                task.params.chat_parser_params.parser.load(chat_params.parser);
-            }
-
-            // reasoning budget sampler
-            if (reasoning_budget >= 0 && !chat_params.thinking_end_tag.empty()) {
-                const llama_vocab * vocab = llama_model_get_vocab(
-                    llama_get_model(ctx_server.get_llama_context()));
-
-                task.params.sampling.reasoning_budget_tokens = reasoning_budget;
-                task.params.sampling.generation_prompt = chat_params.generation_prompt;
-
-                if (!chat_params.thinking_start_tag.empty()) {
-                    task.params.sampling.reasoning_budget_start =
-                        common_tokenize(vocab, chat_params.thinking_start_tag, false, true);
+            if (!raw_prompt.has_value()) {
+                // chat template settings
+                task.params.chat_parser_params = common_chat_parser_params(chat_params);
+                task.params.chat_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+                if (!chat_params.parser.empty()) {
+                    task.params.chat_parser_params.parser.load(chat_params.parser);
                 }
-                task.params.sampling.reasoning_budget_end =
-                    common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
-                task.params.sampling.reasoning_budget_forced =
-                    common_tokenize(vocab, reasoning_budget_message + chat_params.thinking_end_tag, false, true);
+
+                // reasoning budget sampler
+                if (reasoning_budget >= 0 && !chat_params.thinking_end_tag.empty()) {
+                    const llama_vocab * vocab = llama_model_get_vocab(
+                        llama_get_model(ctx_server.get_llama_context()));
+
+                    task.params.sampling.reasoning_budget_tokens = reasoning_budget;
+                    task.params.sampling.generation_prompt = chat_params.generation_prompt;
+
+                    if (!chat_params.thinking_start_tag.empty()) {
+                        task.params.sampling.reasoning_budget_start =
+                            common_tokenize(vocab, chat_params.thinking_start_tag, false, true);
+                    }
+                    task.params.sampling.reasoning_budget_end =
+                        common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
+                    task.params.sampling.reasoning_budget_forced =
+                        common_tokenize(vocab, reasoning_budget_message + chat_params.thinking_end_tag, false, true);
+                }
             }
 
             rd.post_task({std::move(task)});
         }
 
-        if (verbose_prompt) {
+        if (verbose_prompt && !raw_prompt.has_value()) {
             console::set_display(DISPLAY_TYPE_PROMPT);
             console::log("%s\n\n", chat_params.prompt.c_str());
             console::set_display(DISPLAY_TYPE_RESET);
@@ -183,6 +198,8 @@ struct cli_context {
         // server_response_reader automatically cancels pending tasks upon destruction
         return curr_content;
     }
+
+public:
 
     // TODO: support remote files in the future (http, https, etc)
     std::string load_input_file(const std::string & fname, bool is_media) {
@@ -349,7 +366,7 @@ int main(int argc, char ** argv) {
     }
 
     // TODO: maybe support it later?
-    if (params.conversation_mode == COMMON_CONVERSATION_MODE_DISABLED) {
+    if (params.conversation_mode == COMMON_CONVERSATION_MODE_DISABLED && !params.moe_trace_harness) {
         console::error("--no-conversation is not supported by llama-cli\n");
         console::error("please use llama-completion instead\n");
     }
@@ -425,19 +442,54 @@ int main(int argc, char ** argv) {
     if (!params.system_prompt.empty()) {
         console::log("using custom system prompt\n");
     }
-    console::log("\n");
-    console::log("available commands:\n");
-    console::log("  /exit or Ctrl+C     stop or exit\n");
-    console::log("  /regen              regenerate the last response\n");
-    console::log("  /clear              clear the chat history\n");
-    console::log("  /read               add a text file\n");
-    if (inf.has_inp_image) {
-        console::log("  /image <file>       add an image file\n");
-    }
-    if (inf.has_inp_audio) {
-        console::log("  /audio <file>       add an audio file\n");
+    if (params.moe_trace_harness) {
+        console::log("mode       : Flash-MoE trace harness (raw completion)\n");
     }
     console::log("\n");
+    if (!params.moe_trace_harness) {
+        console::log("available commands:\n");
+        console::log("  /exit or Ctrl+C     stop or exit\n");
+        console::log("  /regen              regenerate the last response\n");
+        console::log("  /clear              clear the chat history\n");
+        console::log("  /read               add a text file\n");
+        if (inf.has_inp_image) {
+            console::log("  /image <file>       add an image file\n");
+        }
+        if (inf.has_inp_audio) {
+            console::log("  /audio <file>       add an audio file\n");
+        }
+        console::log("\n");
+    }
+
+    if (params.moe_trace_harness) {
+        if (params.prompt.empty()) {
+            console::error("Flash-MoE trace harness requires --prompt\n");
+            ctx_cli.ctx_server.terminate();
+            inference_thread.join();
+            return 1;
+        }
+
+        result_timings timings;
+        console::log("\n> %s\n\n", params.prompt.c_str());
+        std::string assistant_content = ctx_cli.generate_raw_completion(params.prompt, timings);
+        (void) assistant_content;
+        console::log("\n");
+
+        if (params.show_timings) {
+            console::set_display(DISPLAY_TYPE_INFO);
+            console::log("\n");
+            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
+            console::set_display(DISPLAY_TYPE_RESET);
+        }
+
+        console::set_display(DISPLAY_TYPE_RESET);
+        console::log("\nExiting...\n");
+        ctx_cli.ctx_server.terminate();
+        inference_thread.join();
+        common_log_set_verbosity_thold(LOG_LEVEL_INFO);
+        llama_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
+        return 0;
+    }
 
     // interactive loop
     std::string cur_msg;

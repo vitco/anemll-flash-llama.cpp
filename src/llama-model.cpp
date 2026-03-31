@@ -16,17 +16,31 @@
 
 #include "models/models.h"
 
+#define JSON_ASSERT GGML_ASSERT
+#include "../vendor/nlohmann/json.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+
+static bool llama_flash_moe_mode_is(const llama_model_params & params, const char * mode) {
+    return params.moe_mode != nullptr && mode != nullptr && strcmp(params.moe_mode, mode) == 0;
+}
+
+static int64_t llama_flash_moe_slot_bank_size_for(const llama_model_params & params, int64_t fallback) {
+    const int64_t configured = params.moe_slot_bank > 0 ? params.moe_slot_bank : fallback;
+    return std::max<int64_t>(1, configured);
+}
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -320,10 +334,28 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+    bool flash_moe_slot_bank_enabled = false;
+    bool flash_moe_resident_source_enabled = false;
+    bool flash_moe_oracle_all_hit_enabled = false;
+    bool flash_moe_oracle_prefetch_enabled = false;
+    bool flash_moe_temporal_prefetch_enabled = false;
+    int32_t flash_moe_slot_bank_size = 0;
+    int32_t moe_n_expert_used = 0;
+    std::string flash_moe_trace_file;
+    std::unordered_map<std::string, llama_flash_moe_sidecar_entry> flash_moe_sidecar_entries;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    pimpl->flash_moe_resident_source_enabled = llama_flash_moe_mode_is(params, "resident-slot-bank");
+    pimpl->flash_moe_oracle_all_hit_enabled = llama_flash_moe_mode_is(params, "oracle-all-hit");
+    pimpl->flash_moe_oracle_prefetch_enabled = llama_flash_moe_mode_is(params, "oracle-prefetch");
+    pimpl->flash_moe_temporal_prefetch_enabled = params.moe_prefetch_temporal;
+    pimpl->flash_moe_slot_bank_enabled = llama_flash_moe_mode_is(params, "slot-bank") ||
+            pimpl->flash_moe_resident_source_enabled ||
+            pimpl->flash_moe_oracle_all_hit_enabled ||
+            pimpl->flash_moe_oracle_prefetch_enabled;
+    pimpl->flash_moe_trace_file = params.moe_trace_file ? params.moe_trace_file : "";
 }
 
 llama_model::~llama_model() {
@@ -400,6 +432,21 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     } else {
         GGML_ASSERT(hparams.n_expert_used == 0);
         GGML_ASSERT(hparams.n_expert_groups == 0);
+    }
+
+    pimpl->moe_n_expert_used = hparams.n_expert_used;
+    if (params.moe_topk_override > 0) {
+        if (hparams.n_expert == 0) {
+            throw std::runtime_error(format(
+                "Flash-MoE --moe-topk %d requires a model with routed experts",
+                params.moe_topk_override));
+        }
+        if (params.moe_topk_override > (int32_t) hparams.n_expert_used) {
+            throw std::runtime_error(format(
+                "Flash-MoE --moe-topk %d exceeds GGUF routed expert count %u; this override is reduction-only",
+                params.moe_topk_override, hparams.n_expert_used));
+        }
+        pimpl->moe_n_expert_used = params.moe_topk_override;
     }
 
     std::fill(hparams.n_head_arr.begin(),    hparams.n_head_arr.end(),    0);
@@ -2581,8 +2628,91 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
+    const bool flash_moe_slot_bank = pimpl->flash_moe_slot_bank_enabled;
+    const int64_t flash_moe_slot_count = flash_moe_slot_bank ?
+        llama_flash_moe_slot_bank_size_for(params, std::max<int64_t>(1, pimpl->moe_n_expert_used)) : 0;
 
     const bool use_mmap_buffer = true;
+
+    pimpl->flash_moe_sidecar_entries.clear();
+    pimpl->flash_moe_slot_bank_size = flash_moe_slot_bank ? (int32_t) flash_moe_slot_count : 0;
+
+    if (flash_moe_slot_bank) {
+        if (params.moe_sidecar_path == nullptr) {
+            throw std::runtime_error("slot-bank mode requires --moe-sidecar");
+        }
+
+        if (hparams.n_expert > 0 && flash_moe_slot_count > hparams.n_expert) {
+            throw std::runtime_error(format(
+                "Flash-MoE slot-bank size %lld exceeds model expert count %lld",
+                (long long) flash_moe_slot_count, (long long) hparams.n_expert));
+        }
+
+        const std::filesystem::path sidecar_dir(params.moe_sidecar_path);
+        const std::filesystem::path manifest_path = sidecar_dir / "manifest.json";
+        LLAMA_LOG_INFO("%s: slot-bank opening manifest %s\n", __func__, manifest_path.string().c_str());
+        std::ifstream manifest_file(manifest_path);
+        if (!manifest_file.is_open()) {
+            throw std::runtime_error(format("failed to open Flash-MoE manifest: %s", manifest_path.string().c_str()));
+        }
+
+        nlohmann::json manifest;
+        manifest_file >> manifest;
+        LLAMA_LOG_INFO("%s: slot-bank parsed manifest %s\n", __func__, manifest_path.string().c_str());
+
+        const auto & entries = manifest.at("entries");
+        size_t flash_moe_slot_bytes_all_layers_per_slot = 0;
+        int32_t flash_moe_slot_layers = 0;
+        std::unordered_set<int32_t> flash_moe_slot_layer_set;
+        for (const auto & item : entries) {
+            const std::string tensor_name = item.at("tensor_name").get<std::string>();
+            const std::string tensor_family = item.at("tensor_family").get<std::string>();
+
+            if (tensor_family != "ffn_gate_exps" &&
+                tensor_family != "ffn_up_exps" &&
+                tensor_family != "ffn_down_exps" &&
+                tensor_family != "ffn_gate_up_exps") {
+                continue;
+            }
+
+            llama_flash_moe_sidecar_entry entry;
+            entry.layer             = item.at("layer").get<int32_t>();
+            entry.tensor_name       = tensor_name;
+            entry.tensor_family     = tensor_family;
+            entry.repacked_path     = (sidecar_dir / item.at("repacked_file").get<std::string>()).string();
+            entry.repacked_offset   = item.at("repacked_offset").get<size_t>();
+            entry.exact_byte_length = item.at("exact_byte_length").get<size_t>();
+            entry.bytes_per_expert  = item.at("bytes_per_expert").get<size_t>();
+
+            if (entry.bytes_per_expert == 0) {
+                throw std::runtime_error(format("Flash-MoE manifest entry '%s' has invalid bytes_per_expert = 0", tensor_name.c_str()));
+            }
+
+            flash_moe_slot_bytes_all_layers_per_slot += entry.bytes_per_expert;
+            flash_moe_slot_layer_set.insert(entry.layer);
+            pimpl->flash_moe_sidecar_entries.emplace(entry.tensor_name, std::move(entry));
+        }
+
+        flash_moe_slot_layers = (int32_t) flash_moe_slot_layer_set.size();
+        const size_t flash_moe_slot_bytes_all_layers = flash_moe_slot_bytes_all_layers_per_slot * (size_t) flash_moe_slot_count;
+        const double flash_moe_slot_bytes_avg_per_layer =
+            flash_moe_slot_layers > 0 ? (double) flash_moe_slot_bytes_all_layers / (double) flash_moe_slot_layers : 0.0;
+
+        LLAMA_LOG_INFO("%s: slot-bank reserve estimate: %.2f MiB/layer, %.2f GiB total across %d routed layers (%d slots)\n",
+                __func__,
+                flash_moe_slot_bytes_avg_per_layer / 1024.0 / 1024.0,
+                flash_moe_slot_bytes_all_layers / 1024.0 / 1024.0 / 1024.0,
+                flash_moe_slot_layers,
+                (int) flash_moe_slot_count);
+
+        if (hparams.n_expert > 0 && flash_moe_slot_count == hparams.n_expert) {
+            LLAMA_LOG_WARN("%s: slot-bank size equals the full expert count (%d); this reserves full expert-bank-sized slot tensors and is not a low-memory streamed configuration\n",
+                    __func__, (int) flash_moe_slot_count);
+        }
+
+        LLAMA_LOG_INFO("%s: loaded %zu Flash-MoE routed tensor entries for slot-bank mode\n",
+                __func__, pimpl->flash_moe_sidecar_entries.size());
+    }
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
@@ -2696,6 +2826,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 tn, ne, flags);
         };
 
+        auto create_routed_expert_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
+            if (!flash_moe_slot_bank) {
+                return create_tensor(tn, ne, flags);
+            }
+
+            std::vector<int64_t> dims(ne);
+            GGML_ASSERT(!dims.empty());
+            dims.back() = flash_moe_slot_count;
+
+            return ml.create_tensor_virtual(
+                hparams, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list,
+                tn, dims, flags);
+        };
+
         layers.resize(n_layer);
 
         // TODO: move to a separate function
@@ -2703,10 +2847,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         // helper: try merged gate_up_exps first, fall back to separate gate and up
         auto create_tensor_gate_up_exps = [&](llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
-            layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+            layer.ffn_gate_up_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
             if (layer.ffn_gate_up_exps == nullptr) {
-                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
-                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+                layer.ffn_gate_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+                layer.ffn_up_exps   = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
             }
         };
         switch (arch) {
@@ -4873,7 +5017,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                             // MoE branch
                             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
-                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+                            layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
                             layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
 
                             // Shared expert branch
@@ -4959,7 +5103,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             }
 
                             // MoE branch
-                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+                            layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
                             create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
 
                             // Shared expert branch
@@ -6772,7 +6916,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         const int64_t n_ff_exp = hparams.n_ff_exp;
                         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), { n_embd, n_expert }, 0);
                         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), { n_embd, n_ff_exp, n_expert }, 0);
-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
+                        layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
                         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i), { n_embd, n_ff_exp, n_expert }, 0);
                     }
                 } break;
@@ -7173,7 +7317,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
 
                         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert }, 0);
-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
+                        layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
                         create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
 
                         // Shared experts
@@ -7238,7 +7382,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
 
                         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert }, 0);
-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
+                        layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
                         create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
 
                         // Shared experts
@@ -7520,98 +7664,131 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+    if (flash_moe_slot_bank) {
+        LLAMA_LOG_INFO("%s: slot-bank validating routed tensor coverage for %zu manifest entries\n",
+                __func__, pimpl->flash_moe_sidecar_entries.size());
+        auto require_sidecar_entry = [&](const ggml_tensor * tensor) {
+            if (tensor == nullptr) {
+                return;
+            }
+
+            const std::string name = ggml_get_name(tensor);
+            const auto it = pimpl->flash_moe_sidecar_entries.find(name);
+            if (it == pimpl->flash_moe_sidecar_entries.end()) {
+                throw std::runtime_error(format("missing Flash-MoE sidecar entry for routed tensor '%s'", name.c_str()));
+            }
+
+            if (it->second.bytes_per_expert == 0 || it->second.exact_byte_length == 0) {
+                throw std::runtime_error(format("invalid Flash-MoE sidecar entry for routed tensor '%s'", name.c_str()));
+            }
+        };
+
+        for (const auto & layer : layers) {
+            require_sidecar_entry(layer.ffn_gate_up_exps);
+            require_sidecar_entry(layer.ffn_gate_exps);
+            require_sidecar_entry(layer.ffn_up_exps);
+            require_sidecar_entry(layer.ffn_down_exps);
+        }
+        LLAMA_LOG_INFO("%s: slot-bank routed tensor coverage validated\n", __func__);
+    }
+
+    LLAMA_LOG_INFO("%s: initializing model file mappings\n", __func__);
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    LLAMA_LOG_INFO("%s: model file mappings initialized (%zu files, %zu mappings)\n",
+            __func__, ml.files.size(), ml.mappings.size());
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
-    ctx_buf_maps.reserve(ml.ctx_map.size());
+    ctx_buf_maps.reserve(ml.ctx_map.size() + ml.ctx_map_virtual.size());
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
-    const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
+    const size_t n_max_backend_buffer = (ml.ctx_map.size() + ml.ctx_map_virtual.size()) * std::max<size_t>(1, ml.files.size());
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
-        ggml_context * ctx = ctx_ptr.get();
+    auto create_ctx_buffers = [&](auto & ctx_map_src, bool allow_mmap_host_ptr) {
+        for (auto & [buft, ctx_ptr] : ctx_map_src) {
+            ggml_context * ctx = ctx_ptr.get();
 
-        // skip contexts without tensors
-        if (ggml_get_first_tensor(ctx) == nullptr) {
-            continue;
-        }
-
-        llama_buf_map buf_map;
-        buf_map.reserve(n_max_backend_buffer);
-
-        // check if it is possible to use buffer_from_host_ptr with this buffer type
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        if (!dev) {
-            // FIXME: workaround for CPU backend buft having a NULL device
-            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (!dev) {
-                throw std::runtime_error(format("%s: no CPU backend found", __func__));
+            if (ggml_get_first_tensor(ctx) == nullptr) {
+                continue;
             }
-        }
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
-        bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
-        std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
-            GGML_ASSERT(!ml.no_alloc);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                // only the mmap region containing the tensors in the model is mapped to the backend buffer
-                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
-                //     then we could just use metal for all layers
-                // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
-                void * addr = nullptr;
-                size_t first, last; // NOLINT
-                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-                if (first >= last) {
-                    continue;
+            llama_buf_map buf_map;
+            buf_map.reserve(n_max_backend_buffer);
+
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (!dev) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!dev) {
+                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
                 }
-                const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+            }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            const bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+            const bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+
+            std::vector<ggml_backend_buffer_ptr> bufs;
+            if (allow_mmap_host_ptr && ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+                GGML_ASSERT(!ml.no_alloc);
+                for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                    void * addr = nullptr;
+                    size_t first, last; // NOLINT
+                    ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                    if (first >= last) {
+                        continue;
+                    }
+                    const size_t max_size = ggml_get_max_tensor_size(ctx);
+                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    }
+                    bufs.emplace_back(buf);
+                    buf_map.emplace(idx, buf);
+                }
+            }
+
+            if (bufs.empty()) {
+                ggml_backend_buffer_t buf;
+                if (ml.no_alloc) {
+                    buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        t->buffer = buf;
+                    }
+                } else {
+                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                }
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
-                bufs.emplace_back(buf);
-                buf_map.emplace(idx, buf);
-            }
-        } else {
-            ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
-                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
-                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+                    pimpl->mlock_bufs.emplace_back(new llama_mlock);
+                    auto & mlock_buf = pimpl->mlock_bufs.back();
+                    mlock_buf->init   (ggml_backend_buffer_get_base(buf));
+                    mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
                 }
-            } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                bufs.emplace_back(buf);
+                for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                    buf_map.emplace(idx, buf);
+                }
             }
-            if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
-            }
-            if (use_mlock && ggml_backend_buffer_is_host(buf)) {
-                pimpl->mlock_bufs.emplace_back(new llama_mlock);
-                auto & mlock_buf = pimpl->mlock_bufs.back();
-                mlock_buf->init   (ggml_backend_buffer_get_base(buf));
-                mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
-            }
-            bufs.emplace_back(buf);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
-            }
-        }
-        pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
-        for (auto & buf : buf_map) {
-            // indicate that this buffer contains weights
-            // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
-            ggml_backend_buffer_set_usage(buf.second, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        }
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
-        ctx_buf_maps.emplace_back(ctx, buf_map);
-    }
+            for (auto & buf : buf_map) {
+                ggml_backend_buffer_set_usage(buf.second, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
+
+            ctx_buf_maps.emplace_back(ctx, buf_map);
+        }
+    };
+
+    LLAMA_LOG_INFO("%s: creating backend buffers for materialized tensors\n", __func__);
+    create_ctx_buffers(ml.ctx_map, true);
+    LLAMA_LOG_INFO("%s: creating backend buffers for virtual tensors\n", __func__);
+    create_ctx_buffers(ml.ctx_map_virtual, false);
+    LLAMA_LOG_INFO("%s: backend buffers created for %zu contexts\n", __func__, pimpl->ctxs_bufs.size());
 
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
@@ -7649,11 +7826,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    size_t ctx_load_idx = 0;
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        LLAMA_LOG_INFO("%s: loading tensor data for context %zu/%zu\n",
+                __func__, ctx_load_idx + 1, ctx_buf_maps.size());
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+        ++ctx_load_idx;
     }
+    LLAMA_LOG_INFO("%s: tensor data load complete\n", __func__);
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -7780,6 +7962,9 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: n_ff                  = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_ff(il); }, hparams.n_layer).c_str());
         LLAMA_LOG_INFO("%s: n_expert              = %u\n",     __func__, hparams.n_expert);
         LLAMA_LOG_INFO("%s: n_expert_used         = %u\n",     __func__, hparams.n_expert_used);
+        if (pimpl->moe_n_expert_used != (int32_t) hparams.n_expert_used) {
+            LLAMA_LOG_INFO("%s: moe_topk_override      = %d\n", __func__, pimpl->moe_n_expert_used);
+        }
         LLAMA_LOG_INFO("%s: n_expert_groups       = %d\n",     __func__, hparams.n_expert_groups);
         LLAMA_LOG_INFO("%s: n_group_used          = %d\n",     __func__, hparams.n_group_used);
         LLAMA_LOG_INFO("%s: causal attn           = %d\n",     __func__, hparams.causal_attn);
@@ -7991,6 +8176,47 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+bool llama_model::flash_moe_slot_bank_enabled() const {
+    return pimpl->flash_moe_slot_bank_enabled;
+}
+
+bool llama_model::flash_moe_resident_source_enabled() const {
+    return pimpl->flash_moe_resident_source_enabled;
+}
+
+bool llama_model::flash_moe_oracle_all_hit_enabled() const {
+    return pimpl->flash_moe_oracle_all_hit_enabled;
+}
+
+bool llama_model::flash_moe_oracle_prefetch_enabled() const {
+    return pimpl->flash_moe_oracle_prefetch_enabled;
+}
+
+bool llama_model::flash_moe_temporal_prefetch_enabled() const {
+    return pimpl->flash_moe_temporal_prefetch_enabled;
+}
+
+int32_t llama_model::flash_moe_slot_bank_size() const {
+    return pimpl->flash_moe_slot_bank_size;
+}
+
+int32_t llama_model::moe_n_expert_used() const {
+    return pimpl->moe_n_expert_used;
+}
+
+const char * llama_model::flash_moe_trace_file() const {
+    return pimpl->flash_moe_trace_file.empty() ? nullptr : pimpl->flash_moe_trace_file.c_str();
+}
+
+const llama_flash_moe_sidecar_entry * llama_model::flash_moe_sidecar_entry_for(const char * name) const {
+    const auto it = pimpl->flash_moe_sidecar_entries.find(name);
+    if (it == pimpl->flash_moe_sidecar_entries.end()) {
+        return nullptr;
+    }
+
+    return &it->second;
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
@@ -8691,6 +8917,10 @@ llama_model_params llama_model_default_params() {
     llama_model_params result = {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
+        /*.moe_sidecar_path            =*/ nullptr,
+        /*.moe_mode                    =*/ nullptr,
+        /*.moe_trace_file              =*/ nullptr,
+        /*.moe_quant_map               =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
@@ -8706,6 +8936,10 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.moe_verify_sidecar          =*/ false,
+        /*.moe_prefetch_temporal       =*/ false,
+        /*.moe_slot_bank               =*/ 0,
+        /*.moe_topk_override           =*/ 0,
     };
 
     return result;

@@ -837,8 +837,41 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
     model.t_start_us = tm.t_start_us;
 
     try {
+        const std::string moe_mode = params.moe_mode ? params.moe_mode : "stock";
+        const bool use_resident_bank = moe_mode == "resident-bank";
+        const bool use_resident_slot_bank = moe_mode == "resident-slot-bank";
+        const bool use_slot_bank = moe_mode == "slot-bank";
+        const bool use_oracle_all_hit = moe_mode == "oracle-all-hit";
+        const bool use_oracle_prefetch = moe_mode == "oracle-prefetch";
+        const bool use_stock_resident = moe_mode == "stock" || moe_mode == "resident";
+        const bool use_slot_runtime = use_resident_slot_bank || use_slot_bank || use_oracle_all_hit || use_oracle_prefetch;
+
+        if (!use_stock_resident && !use_resident_bank && !use_slot_runtime) {
+            throw std::runtime_error(format(
+                "Flash-MoE mode '%s' is not implemented in this build; supported modes are stock, resident, resident-bank, resident-slot-bank, slot-bank, oracle-all-hit, oracle-prefetch",
+                moe_mode.c_str()));
+        }
+
+        if ((use_resident_bank || use_slot_runtime) && (params.moe_sidecar_path == nullptr || params.moe_sidecar_path[0] == '\0')) {
+            throw std::runtime_error(format("Flash-MoE %s mode requires --moe-sidecar", moe_mode.c_str()));
+        }
+
+        if ((use_oracle_all_hit || use_oracle_prefetch) && (params.moe_trace_file == nullptr || params.moe_trace_file[0] == '\0')) {
+            throw std::runtime_error(format("Flash-MoE %s mode requires --moe-trace with a replay trace file", moe_mode.c_str()));
+        }
+
+        if (params.moe_prefetch_temporal && !(use_slot_bank || use_resident_slot_bank)) {
+            throw std::runtime_error("Flash-MoE --moe-prefetch-temporal currently requires --moe-mode slot-bank or resident-slot-bank");
+        }
+
+        if ((moe_mode == "stock" || moe_mode == "resident") && params.moe_sidecar_path && params.moe_sidecar_path[0] != '\0') {
+            LLAMA_LOG_WARN("%s: ignoring Flash-MoE sidecar in mode '%s'; use --moe-mode resident-bank to activate sidecar-backed experts\n",
+                    __func__, moe_mode.c_str());
+        }
+
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, params.use_mmap, params.use_direct_io,
-            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides,
+            use_resident_bank ? params.moe_sidecar_path : nullptr, params.moe_verify_sidecar);
 
         ml.print_info();
 
@@ -1191,4 +1224,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

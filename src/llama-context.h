@@ -14,6 +14,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_flash_moe_slot_runtime;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -243,6 +244,10 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+public:
+    bool flash_moe_eval_cb(ggml_tensor * t, bool ask);
+
+private:
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -321,6 +326,10 @@ private:
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
+
+    std::unique_ptr<llama_flash_moe_slot_runtime> flash_moe_slot_runtime;
+    ggml_backend_sched_eval_callback flash_moe_cb_eval_downstream = nullptr;
+    void * flash_moe_cb_eval_downstream_user_data = nullptr;
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;

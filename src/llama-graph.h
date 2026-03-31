@@ -26,6 +26,14 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
+struct llm_flash_moe_slot_runtime_i {
+    virtual ~llm_flash_moe_slot_runtime_i() = default;
+    virtual bool uses_layer(int layer) const = 0;
+    virtual bool uses_native_slot_map(int layer) const = 0;
+    virtual void bind_slot_ids_input(int layer, ggml_tensor * slot_ids) = 0;
+    virtual ggml_tensor * build_slot_ids_tensor(ggml_context * ctx0, ggml_tensor * selected_experts, int layer) = 0;
+};
+
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
@@ -489,6 +497,21 @@ public:
     const llama_memory_hybrid_iswa_context * mctx;
 };
 
+class llm_graph_input_moe_slot_ids : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_slot_ids(
+            llm_flash_moe_slot_runtime_i * runtime,
+            int layer) : runtime(runtime), layer(layer) {}
+    ~llm_graph_input_moe_slot_ids() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * slot_ids = nullptr; // I32 [n_expert_used, n_tokens]
+
+    llm_flash_moe_slot_runtime_i * runtime = nullptr;
+    int layer = -1;
+};
+
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
@@ -535,6 +558,7 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    llm_flash_moe_slot_runtime_i * flash_moe_slot_runtime = nullptr;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -619,7 +643,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            flash_moe_slot_runtime == other.flash_moe_slot_runtime;
     }
 };
 
@@ -741,6 +766,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    llm_flash_moe_slot_runtime_i * flash_moe_slot_runtime;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -853,6 +879,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
+    ggml_tensor * build_inp_moe_slot_ids(int il, int64_t n_expert_used, int64_t n_tokens_cur) const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 

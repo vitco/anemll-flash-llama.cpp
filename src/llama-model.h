@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_flash_moe_sidecar_entry;
 
 // available models
 enum llm_type {
@@ -572,6 +573,15 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    bool flash_moe_slot_bank_enabled() const;
+    bool flash_moe_resident_source_enabled() const;
+    bool flash_moe_oracle_all_hit_enabled() const;
+    bool flash_moe_oracle_prefetch_enabled() const;
+    bool flash_moe_temporal_prefetch_enabled() const;
+    int32_t flash_moe_slot_bank_size() const;
+    int32_t moe_n_expert_used() const;
+    const char * flash_moe_trace_file() const;
+    const llama_flash_moe_sidecar_entry * flash_moe_sidecar_entry_for(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
@@ -592,6 +602,16 @@ private:
 };
 
 const char * llm_type_name(llm_type type);
+
+struct llama_flash_moe_sidecar_entry {
+    int32_t     layer             = -1;
+    std::string tensor_name;
+    std::string tensor_family;
+    std::string repacked_path;
+    size_t      repacked_offset   = 0;
+    size_t      exact_byte_length = 0;
+    size_t      bytes_per_expert  = 0;
+};
 
 // For internal test use
 // TODO: remove

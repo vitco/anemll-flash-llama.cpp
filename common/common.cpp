@@ -1326,6 +1326,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.moe_sidecar_path   = params.moe_sidecar.empty() ? nullptr : params.moe_sidecar.c_str();
+    mparams.moe_mode           = params.moe_mode.empty() ? nullptr : params.moe_mode.c_str();
+    mparams.moe_trace_file     = params.moe_trace.empty() ? nullptr : params.moe_trace.c_str();
+    mparams.moe_quant_map      = params.moe_quant_map.empty() ? nullptr : params.moe_quant_map.c_str();
+    mparams.moe_verify_sidecar = params.moe_verify_sidecar;
+    mparams.moe_prefetch_temporal = params.moe_prefetch_temporal;
+    mparams.moe_slot_bank      = params.moe_slot_bank;
+    mparams.moe_topk_override  = params.moe_topk_override;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

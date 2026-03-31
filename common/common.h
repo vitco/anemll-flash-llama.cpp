@@ -543,6 +543,7 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+    bool moe_verify_sidecar = false; // validate Flash-MoE sidecar metadata parity during model load
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -633,6 +634,15 @@ struct common_params {
     std::vector<int32_t> n_pp;
     std::vector<int32_t> n_tg;
     std::vector<int32_t> n_pl;
+
+    std::string moe_sidecar   = "";      // Flash-MoE sidecar directory or manifest path              // NOLINT
+    std::string moe_mode      = "stock"; // Flash-MoE runtime mode                                     // NOLINT
+    std::string moe_trace     = "";      // reserved trace output path                                 // NOLINT
+    std::string moe_quant_map = "";      // reserved dynamic-quant policy path                         // NOLINT
+    int32_t     moe_slot_bank = 0;       // reserved slot-bank size                                    // NOLINT
+    int32_t     moe_topk_override = 0;   // runtime reduction-only routed-expert override              // NOLINT
+    bool        moe_prefetch_temporal = false; // runtime temporal prefetch for slot-bank              // NOLINT
+    bool        moe_trace_harness = false; // llama-cli raw non-interactive harness for long traces    // NOLINT
 
     // retrieval params
     std::vector<std::string> context_files; // context files to embed

@@ -804,6 +804,12 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
         return false;
     }
 
+    const uint32_t n_batch = llama_n_batch(ctx_tgt);
+    if (n_batch < 2) {
+        LOG_WRN("%s: skipping compatibility probe because n_batch = %u < 2\n", __func__, n_batch);
+        return false;
+    }
+
     bool res = true;
 
     llama_memory_clear(mem, true);

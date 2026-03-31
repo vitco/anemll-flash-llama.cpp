@@ -1,0 +1,4 @@
+source_repo=/Users/anemll/SourceRelease/GITHUB/ML_playground/llama.cpp
+source_commit=340807273b6aa765c9353804b7ce680920373cb6
+vendored_at=2026-03-29
+notes=Source-only import for Flash-MoE GGUF development inside mlx-flash-moe/llama.cpp

@@ -11,6 +11,7 @@ struct llama_cparams {
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
+    uint32_t n_expert_used;   // effective routed experts per token during inference
     uint32_t n_seq_max;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing

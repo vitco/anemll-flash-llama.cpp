@@ -5,11 +5,16 @@
 #include "gguf.h"
 #include "llama-hparams.h"
 
+#define JSON_ASSERT GGML_ASSERT
+#include "../vendor/nlohmann/json.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <regex>
 
@@ -516,7 +521,9 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const char * moe_sidecar_path,
+        bool moe_verify_sidecar)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -658,6 +665,10 @@ llama_model_loader::llama_model_loader(
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
         }
+
+        if (moe_sidecar_path != nullptr && moe_sidecar_path[0] != '\0') {
+            apply_moe_sidecar_overrides(moe_sidecar_path, moe_verify_sidecar);
+        }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
@@ -782,6 +793,100 @@ llama_model_loader::llama_model_loader(
     this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
+}
+
+void llama_model_loader::apply_moe_sidecar_overrides(const std::string & path, bool verify_sidecar) {
+    namespace fs = std::filesystem;
+    using json = nlohmann::json;
+
+    const fs::path sidecar_input(path);
+    const fs::path manifest_path = fs::is_directory(sidecar_input) ? sidecar_input / "manifest.json" : sidecar_input;
+    const fs::path manifest_dir = manifest_path.parent_path();
+
+    std::ifstream fin(manifest_path);
+    if (!fin.is_open()) {
+        throw std::runtime_error(format("%s: failed to open Flash-MoE manifest %s", __func__, manifest_path.string().c_str()));
+    }
+
+    json manifest = json::parse(fin, nullptr, true, true);
+    const auto entries_it = manifest.find("entries");
+    if (entries_it == manifest.end() || !entries_it->is_array()) {
+        throw std::runtime_error(format("%s: Flash-MoE manifest %s is missing an 'entries' array", __func__, manifest_path.string().c_str()));
+    }
+
+    std::unordered_map<std::string, uint16_t> sidecar_file_indices;
+    size_t n_overrides = 0;
+
+    for (const auto & entry : *entries_it) {
+        if (!entry.is_object()) {
+            throw std::runtime_error(format("%s: invalid Flash-MoE manifest entry in %s", __func__, manifest_path.string().c_str()));
+        }
+
+        const std::string tensor_name = entry.contains("original_gguf_tensor_name")
+            ? entry.at("original_gguf_tensor_name").get<std::string>()
+            : entry.at("tensor_name").get<std::string>();
+
+        auto it_weight = weights_map.find(tensor_name);
+        if (it_weight == weights_map.end()) {
+            throw std::runtime_error(format("%s: Flash-MoE tensor '%s' was not found in the source GGUF", __func__, tensor_name.c_str()));
+        }
+
+        const llama_tensor_weight original = it_weight->second;
+        ggml_tensor * tensor = original.tensor;
+        const size_t tensor_nbytes = ggml_nbytes(tensor);
+        const size_t exact_byte_length = entry.value("exact_byte_length", tensor_nbytes);
+        if (exact_byte_length != tensor_nbytes) {
+            throw std::runtime_error(format(
+                "%s: Flash-MoE tensor '%s' expected %zu bytes but manifest declares %zu",
+                __func__, tensor_name.c_str(), tensor_nbytes, exact_byte_length));
+        }
+
+        if (verify_sidecar) {
+            if (entry.contains("source_shard_index")) {
+                const uint16_t shard_index = entry.at("source_shard_index").get<uint16_t>();
+                if (shard_index != original.idx) {
+                    throw std::runtime_error(format(
+                        "%s: Flash-MoE tensor '%s' source shard mismatch: manifest=%u gguf=%u",
+                        __func__, tensor_name.c_str(), shard_index, original.idx));
+                }
+            }
+            if (entry.contains("source_offset")) {
+                const size_t source_offset = entry.at("source_offset").get<size_t>();
+                if (source_offset != original.offs) {
+                    throw std::runtime_error(format(
+                        "%s: Flash-MoE tensor '%s' source offset mismatch: manifest=%zu gguf=%zu",
+                        __func__, tensor_name.c_str(), source_offset, original.offs));
+                }
+            }
+        }
+
+        const std::string repacked_file = entry.contains("repacked_file")
+            ? entry.at("repacked_file").get<std::string>()
+            : entry.at("sidecar_file").get<std::string>();
+        const size_t repacked_offset = entry.value("repacked_offset", size_t(0));
+        const fs::path repacked_path = (manifest_dir / repacked_file).lexically_normal();
+        const std::string repacked_key = repacked_path.string();
+
+        auto it_sidecar = sidecar_file_indices.find(repacked_key);
+        if (it_sidecar == sidecar_file_indices.end()) {
+            files.emplace_back(new llama_file(repacked_key.c_str(), "rb", use_direct_io));
+            it_sidecar = sidecar_file_indices.emplace(repacked_key, files.size() - 1).first;
+        }
+
+        const uint16_t sidecar_idx = it_sidecar->second;
+        const auto & sidecar_file = files.at(sidecar_idx);
+        if (repacked_offset + tensor_nbytes < repacked_offset || repacked_offset + tensor_nbytes > sidecar_file->size()) {
+            throw std::runtime_error(format(
+                "%s: Flash-MoE tensor '%s' points outside sidecar file %s",
+                __func__, tensor_name.c_str(), repacked_key.c_str()));
+        }
+
+        it_weight->second = llama_tensor_weight(sidecar_idx, repacked_offset, tensor);
+        ++n_overrides;
+    }
+
+    LLAMA_LOG_INFO("%s: applied Flash-MoE sidecar overrides from %s (%zu tensors across %zu sidecar files)\n",
+            __func__, manifest_path.string().c_str(), n_overrides, sidecar_file_indices.size());
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1240,6 +1345,220 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     } else {
         n_created++;
     }
+
+    return tensor;
+}
+
+struct ggml_tensor * llama_model_loader::create_tensor_virtual(
+        const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::vector<int64_t> & ne, int flags) {
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map_virtual.find(buft);
+        if (it == ctx_map_virtual.end()) {
+            int max_n_tensors = n_tensors;
+            max_n_tensors += 1;
+            max_n_tensors += hparams.n_layer*2;
+            if (files.empty()) {
+                max_n_tensors += hparams.n_layer*256;
+            }
+            const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
+
+            ggml_init_params params = {
+                /*.mem_size   =*/ ctx_size,
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                throw std::runtime_error(format("failed to create ggml context"));
+            }
+
+            ctx_map_virtual.emplace(buft, ctx);
+
+            return ctx;
+        }
+        return it->second.get();
+    };
+
+    auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
+        if (!t_meta) {
+            if (flags & TENSOR_NOT_REQUIRED) {
+                return nullptr;
+            }
+            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
+        }
+
+        llm_tensor tn_tensor = tn.tensor;
+        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
+            tn_tensor = LLM_TENSOR_OUTPUT;
+        }
+
+        llm_tensor_info info;
+        try {
+            info = llm_tensor_info_for(tn_tensor);
+        } catch (const std::out_of_range &) {
+            throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
+        }
+
+        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+            const size_t nbytes = ggml_nbytes(t_meta);
+            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+
+            size_data -= nbytes;
+            n_created++;
+
+            return nullptr;
+        }
+
+        ggml_op op;
+        const bool bias = tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0;
+        if (bias) {
+            if (info.op == GGML_OP_MUL_MAT_ID) {
+                op = GGML_OP_ADD_ID;
+            } else {
+                op = GGML_OP_ADD;
+            }
+        } else {
+            op = info.op;
+        }
+
+        if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
+            if (tn.bid != -1) {
+                GGML_ABORT("input/output layer tensor %s used with a layer number", tn.str().c_str());
+            }
+        } else if (tn.bid == -1) {
+            GGML_ABORT("repeating layer tensor %s used without a layer number", tn.str().c_str());
+        }
+
+        const buft_list_t * buft_list;
+        switch (info.layer) {
+            case LLM_TENSOR_LAYER_INPUT:
+                buft_list = buft_list_input;
+                break;
+            case LLM_TENSOR_LAYER_OUTPUT:
+                buft_list = buft_list_output;
+                break;
+            case LLM_TENSOR_LAYER_REPEATING:
+                GGML_ASSERT(buft_list_layer != nullptr);
+                buft_list = buft_list_layer;
+                break;
+            default:
+                GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
+        }
+
+        ggml_backend_buffer_type_t buft = nullptr;
+
+        if (tensor_buft_overrides) {
+            std::string tensor_name = tn.str();
+            for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+                std::regex pattern(overrides->pattern);
+                if (std::regex_search(tensor_name, pattern)) {
+                    if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                    } else {
+                        buft = overrides->buft;
+                    }
+
+                    LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
+                            tensor_name.c_str(),
+                            ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                            ggml_backend_buft_name(buft));
+                    break;
+                }
+            }
+        }
+
+        if (!buft) {
+            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            if (!buft) {
+                throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+            }
+        }
+
+        if (use_mmap) {
+            auto * buft_dev = ggml_backend_buft_get_device(buft);
+            if (buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!cpu_dev) {
+                    throw std::runtime_error("no CPU backend found");
+                }
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+            }
+        }
+
+        if (buft != buft_list->front().second) {
+            if (n_tensors_moved == 0) {
+                first_tensor_moved_name = t_meta->name;
+                first_tensor_moved_type_name = ggml_type_name(t_meta->type);
+                first_moved_from_buft = buft_list->front().second;
+                first_moved_to_buft   = buft;
+            }
+            n_tensors_moved++;
+        }
+
+        return buft;
+    };
+
+    if (files.empty()) {
+        ggml_tensor t_meta;
+        memset(&t_meta, 0, sizeof(ggml_tensor));
+        t_meta.type = GGML_TYPE_F32;
+        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+            t_meta.ne[dim] = dim < ne.size() ? ne[dim] : 1;
+            GGML_ASSERT(t_meta.ne[dim] >= 1);
+            t_meta.nb[dim] = dim == 0 ? ggml_type_size(t_meta.type) : t_meta.ne[dim-1]*t_meta.nb[dim-1];
+            GGML_ASSERT(t_meta.nb[dim] >= 1);
+        }
+        ggml_set_name(&t_meta, tn.str().c_str());
+
+        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+        GGML_ASSERT(buft != nullptr);
+        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+        ggml_set_name(ret, tn.str().c_str());
+        return ret;
+    }
+
+    ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
+    ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
+    if (buft == nullptr) {
+        return nullptr;
+    }
+    ggml_context * ctx = ctx_for_buft(buft);
+
+    if ((flags & TENSOR_DUPLICATED) != 0) {
+        ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+        if (t) {
+            return t;
+        }
+    }
+
+    if (t_meta == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor t_virtual;
+    memset(&t_virtual, 0, sizeof(ggml_tensor));
+    t_virtual.type = t_meta->type;
+    for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+        t_virtual.ne[dim] = dim < ne.size() ? ne[dim] : 1;
+        GGML_ASSERT(t_virtual.ne[dim] >= 1);
+        t_virtual.nb[dim] = dim == 0 ? ggml_type_size(t_virtual.type) : t_virtual.ne[dim - 1]*t_virtual.nb[dim - 1];
+        GGML_ASSERT(t_virtual.nb[dim] >= 1);
+    }
+    ggml_set_name(&t_virtual, ggml_get_name(t_meta));
+
+    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_virtual);
+    ggml_set_name(tensor, ggml_get_name(t_meta));
+
+    if (flags & TENSOR_DUPLICATED) {
+        size_data += ggml_nbytes(tensor);
+    } else {
+        n_created++;
+    }
+
+    weights_map.erase(ggml_get_name(t_meta));
 
     return tensor;
 }
