@@ -8,7 +8,8 @@ The important distinction is:
 - the native handoff into the routed graph is model-specific
 
 Qwen35MoE is the current reference implementation.
-`deepseek2`/Kimi should be treated as the next port, not as something that automatically inherits the Qwen path.
+In this fork, Qwen also uses GPU-bank placement by default when `-ngl > 0`.
+`deepseek2`/Kimi should still be treated as the next port, not as something that automatically inherits the Qwen path.
 
 ## What Is Shared Already
 
@@ -52,6 +53,9 @@ The shape is:
 3. If yes, the graph builds a slot-id tensor from `ffn_moe_topk` through a custom op.
 4. Routed expert matmuls consume slot ids, while the original expert ids remain available for gating-weight lookups.
 5. The old callback/input-tensor path remains available as a fallback.
+
+In this fork, Qwen also defaults to GPU-bank placement for slot-bank tensors when `-ngl > 0`.
+Use `LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1` only for A/B comparison against the older host-backed path.
 
 This is intentionally smaller than a deep `ggml` operator rewrite.
 

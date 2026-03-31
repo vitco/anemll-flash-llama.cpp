@@ -101,7 +101,8 @@ python3 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
   --svg-out /Users/anemll/Models/flash/logs/kimi-k25-cache-dashboard.svg
 ```
 
-Long Kimi trace run without the normal `llama-cli` chat-loop exit:
+Long Kimi trace run without the normal `llama-cli` chat-loop exit
+current Kimi safe fallback only:
 
 ```bash
 mkdir -p /Users/anemll/Models/flash/logs
@@ -126,6 +127,10 @@ nohup ./llama.cpp/build-flashmoe/bin/llama-cli \
   -n 12000 \
   > /Users/anemll/Models/flash/logs/kimi-k25-1h-trace.log 2>&1 &
 ```
+
+Kimi sidecar modes stay on `-ngl 0` in this fork on purpose.
+This is the current safety fallback, not the new Qwen-style default.
+The GPU-native routed bank path is not yet validated there.
 
 ## Run with the sidecar
 
@@ -156,14 +161,19 @@ nohup ./llama.cpp/build-flashmoe/bin/llama-cli \
   -n 32 -st
 ```
 
+In this fork, Qwen `slot-bank` is expected to use `-ngl 999`.
+You do not need to know how many layers are routed MoE versus dense/shared; routed expert tensors are virtualized out of the normal GGUF loader and continue to come from the sidecar path.
+
 ## Notes
 
 - The extractor writes one raw bank file per sparse layer: `layer_XXX.bin`.
 - Each file concatenates whole-tensor expert payloads in a stable layer/family order.
 - `resident-bank` overrides expert tensors at load time and keeps the dense graph untouched.
 - `slot-bank` reads experts on demand with `pread()` into a small resident slot bank. It is still experimental.
+- In this fork, Qwen `slot-bank` defaults to GPU-offloaded dense/shared execution with GPU-visible routed slot banks when `-ngl > 0`. Set `LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1` only if you need the older host-backed comparison path.
 - `--moe-topk N` is an experimental reduction-only runtime override for routed experts per token. It must be less than or equal to the GGUF model's native MoE top-k.
 - For Qwen3.5 small-memory smoke tests, prefer `--moe-slot-bank 32` or `64`. A slot bank of `256` effectively reserves a full routed-expert bank for that model.
+- Kimi/DeepSeek2 still uses `-ngl 0` in sidecar modes while the GPU-native routed bank path is being validated there.
 - Partial sidecars are supported: any tensor not present in the manifest continues to load from the original GGUF.
 - `flashmoe_cache_estimator.py` models persistent-bank cost from the exact manifest and, when given a trace, reports static-bank, global-budget, and LRU coverage/miss estimates.
 - The default estimator output is terminal-friendly text with ASCII bars; `--svg-out` adds a self-contained dashboard file.

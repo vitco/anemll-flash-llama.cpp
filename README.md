@@ -286,12 +286,14 @@ pread install: 265.55 ms   (9,297 pread ops, 2.72 GiB total)
 
 The GPU upload cost (114 ms) is new vs the old CPU-only path — but it's worth it because GPU compute on the dense path is 3-4x faster.
 
-### Resident Modes (llama-bench, 3 reps each)
+### Baseline vs Slot-Bank
 
 | Mode | Decode tok/s | Prefill tok/s | Notes |
 |------|------------:|-------------:|-------|
-| `stock` (default GGUF, `-ngl 99`) | **109.0** | 3,070 | All experts resident in GPU |
-| `slot-bank 128` (sidecar, `-ngl 99`) | **53.0** | 75.5 | GPU-bank, pread streaming |
+| `stock` (all resident, `-ngl 99`) | **109.0** | 3,070 | Ceiling — all experts in GPU |
+| **`slot-bank 128`** (sidecar, `-ngl 99`) | **53.0** | 75.5 | GPU-bank + pread streaming |
+
+Slot-bank reaches 49% of stock. The gap is pread I/O + GPU upload for the 16% of experts that miss the bank each token.
 
 Slot-bank decode is 49% of stock — the gap is pread I/O + GPU upload for the 16% of experts that miss the bank each token.
 

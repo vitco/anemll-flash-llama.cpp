@@ -42,6 +42,11 @@ static int64_t llama_flash_moe_slot_bank_size_for(const llama_model_params & par
     return std::max<int64_t>(1, configured);
 }
 
+static bool llama_flash_moe_experimental_gpu_bank_enabled() {
+    const char * disable_value = std::getenv("LLAMA_FLASH_MOE_DISABLE_GPU_BANK");
+    return disable_value == nullptr || disable_value[0] == '\0' || std::strcmp(disable_value, "0") == 0;
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -2629,6 +2634,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
     const bool flash_moe_slot_bank = pimpl->flash_moe_slot_bank_enabled;
+    const bool flash_moe_experimental_gpu_bank = flash_moe_slot_bank &&
+            n_gpu_layers != 0 &&
+            llama_flash_moe_experimental_gpu_bank_enabled();
     const int64_t flash_moe_slot_count = flash_moe_slot_bank ?
         llama_flash_moe_slot_bank_size_for(params, std::max<int64_t>(1, pimpl->moe_n_expert_used)) : 0;
 
@@ -2636,6 +2644,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     pimpl->flash_moe_sidecar_entries.clear();
     pimpl->flash_moe_slot_bank_size = flash_moe_slot_bank ? (int32_t) flash_moe_slot_count : 0;
+
+    if (flash_moe_slot_bank && n_gpu_layers != 0) {
+        if (flash_moe_experimental_gpu_bank) {
+            LLAMA_LOG_WARN("%s: Flash-MoE GPU-bank placement is enabled in this fork; routed slot-bank tensors will use the repeating-layer buffer list instead of forced CPU buffers (set LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1 to force the legacy host-backed path)\n",
+                    __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: slot-bank routed expert tensors are forced onto CPU/host-backed virtual buffers because LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1 is set; --n-gpu-layers offloads only dense/shared tensors in this fallback mode\n",
+                    __func__);
+        }
+    }
 
     if (flash_moe_slot_bank) {
         if (params.moe_sidecar_path == nullptr) {
@@ -2704,6 +2722,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 flash_moe_slot_bytes_all_layers / 1024.0 / 1024.0 / 1024.0,
                 flash_moe_slot_layers,
                 (int) flash_moe_slot_count);
+
+        LLAMA_LOG_INFO("%s: slot-bank routed expert tensors are virtualized and excluded from the normal GGUF weight-loading path; --n-gpu-layers only places dense/shared tensors, while routed expert bytes continue to come from the Flash-MoE sidecar path\n",
+                __func__);
 
         if (hparams.n_expert > 0 && flash_moe_slot_count == hparams.n_expert) {
             LLAMA_LOG_WARN("%s: slot-bank size equals the full expert count (%d); this reserves full expert-bank-sized slot tensors and is not a low-memory streamed configuration\n",
@@ -2835,8 +2856,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             GGML_ASSERT(!dims.empty());
             dims.back() = flash_moe_slot_count;
 
+            const buft_list_t * routed_buft_list = &pimpl->cpu_buft_list;
+            if (flash_moe_experimental_gpu_bank && tn.bid >= 0) {
+                routed_buft_list = pimpl->dev_layer.at(tn.bid).buft_list;
+            }
+
             return ml.create_tensor_virtual(
-                hparams, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list,
+                hparams, &pimpl->cpu_buft_list, routed_buft_list, routed_buft_list, routed_buft_list,
                 tn, dims, flags);
         };
 

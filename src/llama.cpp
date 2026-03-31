@@ -826,6 +826,11 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+static bool llama_flash_moe_experimental_gpu_bank_enabled() {
+    const char * disable_value = std::getenv("LLAMA_FLASH_MOE_DISABLE_GPU_BANK");
+    return disable_value == nullptr || disable_value[0] == '\0' || std::strcmp(disable_value, "0") == 0;
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static int llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, llama_model & model, llama_model_params & params) {
@@ -845,6 +850,7 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
         const bool use_oracle_prefetch = moe_mode == "oracle-prefetch";
         const bool use_stock_resident = moe_mode == "stock" || moe_mode == "resident";
         const bool use_slot_runtime = use_resident_slot_bank || use_slot_bank || use_oracle_all_hit || use_oracle_prefetch;
+        const bool use_flash_moe_sidecar_runtime = use_resident_bank || use_slot_runtime;
 
         if (!use_stock_resident && !use_resident_bank && !use_slot_runtime) {
             throw std::runtime_error(format(
@@ -888,6 +894,22 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+
+        if (use_flash_moe_sidecar_runtime && params.n_gpu_layers != 0) {
+            const bool flash_moe_experimental_gpu_bank = llama_flash_moe_experimental_gpu_bank_enabled();
+            if (flash_moe_experimental_gpu_bank) {
+                LLAMA_LOG_WARN("%s: Flash-MoE GPU-bank placement is enabled for mode '%s' with n_gpu_layers=%d in this fork; routed slot-bank tensors will follow repeating-layer placement while routed expert bytes continue to come from the sidecar path\n",
+                        __func__, moe_mode.c_str(), params.n_gpu_layers);
+            } else {
+                LLAMA_LOG_WARN("%s: Flash-MoE mode '%s' with n_gpu_layers=%d is running with LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1; routed slot-bank tensors remain host-backed and GPU offload only affects dense/shared tensors in this fallback mode\n",
+                        __func__, moe_mode.c_str(), params.n_gpu_layers);
+            }
+            if (model.arch == LLM_ARCH_DEEPSEEK2) {
+                throw std::runtime_error(
+                    "Flash-MoE GPU offload is currently disabled for DeepSeek2/Kimi sidecar modes in this fork while the GPU-native routed bank path is being validated there; use -ngl 0");
+            }
+        }
+
         if (model.arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
