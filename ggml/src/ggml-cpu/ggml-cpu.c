@@ -1519,6 +1519,19 @@ static void ggml_compute_forward_mul_mat_id(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    static int trace_cpu_mmid = -1;
+    if (trace_cpu_mmid == -1) {
+        const char * val = getenv("GGML_CPU_MMID_TRACE");
+        trace_cpu_mmid = (val != NULL && val[0] != '\0' && strcmp(val, "0") != 0) ? 1 : 0;
+    }
+    if (trace_cpu_mmid && ith == 0) {
+        GGML_LOG_INFO("%s: dst=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0=%s src1=%s ids=%s nth=%d\n",
+                __func__,
+                dst->name,
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                src0->name, src1->name, ids->name, nth);
+    }
+
     const enum ggml_type type = src0->type;
 
     const bool src1_cont = ggml_is_contiguous(src1);
