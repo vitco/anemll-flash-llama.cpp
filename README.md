@@ -69,6 +69,56 @@ And native code only matters if the execution boundary really moves.
 - `--moe-trace` and `--moe-verify-sidecar` for replay and validation workflows
 - sidecar extract / inspect / verify tooling under [`tools/flashmoe-sidecar/`](./tools/flashmoe-sidecar/)
 
+## Build
+
+```bash
+git clone https://github.com/Anemll/anemll-flash-llama.cpp.git
+cd anemll-flash-llama.cpp
+
+# Metal (Apple Silicon) — recommended
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(sysctl -n hw.ncpu) -- llama-cli llama-bench llama-perplexity
+
+# CUDA (NVIDIA)
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc) -- llama-cli llama-bench
+
+# CPU-only fallback
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc) -- llama-cli llama-bench
+```
+
+To disable GPU-bank placement at compile time (not usually needed — it's also controllable at runtime via `LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1`):
+
+```bash
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_FLASH_MOE_GPU_BANK=OFF
+```
+
+## Choosing `--moe-slot-bank` Size
+
+The slot-bank holds N recently-used experts per layer in memory. Larger banks mean higher hit rates but more memory.
+
+**Qwen3.5-35B-A3B** (256 experts/layer, ~920 KB per expert slot):
+
+| Bank | Memory | Good for |
+|-----:|-------:|----------|
+| 8 | 0.3 GiB | 8 GB machines — leaves room for dense weights |
+| 16 | 0.6 GiB | 8-16 GB — good balance for small machines |
+| 32 | 1.1 GiB | 16-32 GB |
+| 64 | 2.2 GiB | 32-64 GB |
+| 128 | 4.5 GiB | 64+ GB — diminishing returns above this |
+
+Rule of thumb: bank should be 5-15% of available RAM. On machines where the GGUF fits entirely in memory, just use `--moe-mode stock` (no sidecar needed).
+
+**Quick reference by machine:**
+
+| Machine | RAM | Recommended | Notes |
+|---------|----:|-------------|-------|
+| M1/M2 8 GB | 8 GB | `--moe-slot-bank 16 -ngl 0` | Dense on CPU, experts streamed |
+| M1/M2 16 GB | 16 GB | `--moe-slot-bank 32 -ngl 99` | Dense on GPU if it fits |
+| M3/M4 Pro 36 GB | 36 GB | `--moe-slot-bank 64 -ngl 99` | 35B fits resident — use stock |
+| M4/M5 Max 128 GB | 128 GB | `--moe-slot-bank 128 -ngl 99` | 35B: use stock. 397B: slot-bank |
+
 ## How It Works: Dense + Experts Split
 
 A Mixture-of-Experts model has two kinds of weights:
@@ -130,21 +180,21 @@ python3 tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
   --sidecar ~/Models/flash/qwen35
 # → verified 120 Flash-MoE sidecar entries against 1 GGUF file(s)
 
-# 5. Run slot-bank inference
+# 5. Run (adjust --moe-slot-bank and -ngl to your machine, see table above)
+#    128 GB: --moe-slot-bank 128 -ngl 99
+#    8 GB:   --moe-slot-bank 16  -ngl 0
 build/bin/llama-cli \
   -m ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen35 \
-  --moe-slot-bank 128 --moe-topk 4 --moe-prefetch-temporal \
+  --moe-slot-bank 16 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
-  -fit on \
-  -ub 4 -b 64 -ngl 999 -c 256 --seed 0 --temp 0 \
+  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
   -p "What is Apple Neural Engine" -n 120
 ```
 
-In the default build, `slot-bank` does not put routed expert banks on GPU.
-Routed expert tensors are virtualized out of the normal GGUF weight loader, so `-ngl 999` applies the regular offload policy to dense/shared tensors while routed expert bytes continue to come from the sidecar path. Keep `--fit` enabled here: on unified-memory systems it clamps dense/shared offload against the routed slot-bank reserve.
-
-For MLX-style diagnostics and prefill simulations, add `--moe-shared-only` to keep the shared expert path active while forcing the routed MoE contribution to zero. This is useful when you want the same dense/shared placement and sampler settings without routed miss traffic.
+`-ngl 99`: offload dense weights to GPU (use when dense weights fit in VRAM).
+`-ngl 0`: keep everything on CPU (8 GB machines, or when GPU memory is tight).
+`--moe-slot-bank N`: see the sizing table above — 16 for 8 GB, 128 for 128 GB.
 
 ### Kimi-K2.5 (5-shard GGUF, 217 GB sidecar)
 
@@ -172,14 +222,15 @@ python3 tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
   --sidecar ~/Models/flash/Kimi-K2.5-sidecar
 # → verified 180 Flash-MoE sidecar entries against 5 GGUF file(s)
 
-# 5. Run slot-bank inference
+# 5. Run (adjust --moe-slot-bank and -ngl to your machine, see table above)
+#    128 GB: --moe-slot-bank 128 -ngl 99
+#    8 GB:   --moe-slot-bank 16  -ngl 0
 build/bin/llama-cli \
   -m ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/Kimi-K2.5-sidecar \
   --moe-slot-bank 64 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
-  -fit on \
-  -ub 4 -b 64 -ngl 999 -c 256 --seed 0 --temp 0 \
+  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
   -p "What is Apple Neural Engine" -n 100
 ```
 
@@ -239,7 +290,7 @@ Recommended config:
 ```bash
 llama-cli -m Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen35 \
-  --moe-slot-bank 128 --moe-topk 4 --moe-prefetch-temporal \
+  --moe-slot-bank 16 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
   -ub 4 -b 64 -ngl 99 -c 256 --seed 0 --temp 0 \
   -p “What is Apple Neural Engine” -n 120
