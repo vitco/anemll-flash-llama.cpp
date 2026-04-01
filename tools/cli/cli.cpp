@@ -95,6 +95,10 @@ std::pair<std::string, int> oracle_parse_name_layer(const std::string & raw_name
 bool oracle_wants_base_name(const std::string_view base_name) {
     return base_name == "embd" ||
            base_name == "attn_norm" ||
+           base_name == "q_pe" ||
+           base_name == "k_pe" ||
+           base_name == "kv_cmpr" ||
+           base_name == "q_nope_absorbed_perm" ||
            base_name == "attn_out" ||
            base_name == "kqv_out" ||
            base_name == "ffn_inp" ||
@@ -203,6 +207,10 @@ public:
         manifest["tensor_names"] = json::array({
             "embd",
             "attn_norm",
+            "q_pe",
+            "k_pe",
+            "kv_cmpr",
+            "q_nope_absorbed_perm",
             "attn_out",
             "kqv_out",
             "ffn_inp",
