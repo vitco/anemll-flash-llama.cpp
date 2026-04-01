@@ -11,11 +11,21 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+
+static bool llama_flash_moe_experimental_metal_split_glu_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_SPLIT_GLU");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
 
 // dedup helpers
 
@@ -1244,6 +1254,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    if (cparams.moe_shared_only) {
+        ggml_tensor * moe_out = ggml_cont(ctx0, ggml_scale(ctx0, cur, 0.0f));
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -1321,20 +1337,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
+    const bool force_single_expert = cparams.moe_force_expert >= 0;
+    if (force_single_expert) {
+        n_expert_used = 1;
+    }
+
     // select experts
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
-    ggml_tensor * selected_experts_mm = selected_experts;
-    if (flash_moe_slot_runtime != nullptr && flash_moe_slot_runtime->uses_layer(il)) {
-        if (flash_moe_slot_runtime->uses_native_slot_map(il)) {
-            selected_experts_mm = flash_moe_slot_runtime->build_slot_ids_tensor(ctx0, selected_experts, il);
-            cb(selected_experts_mm, "ffn_moe_slot_ids_native", il);
-        } else {
-            selected_experts_mm = build_inp_moe_slot_ids(il, selected_experts->ne[0], selected_experts->ne[1]);
-            cb(selected_experts_mm, "ffn_moe_slot_ids", il);
-        }
-    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
@@ -1376,6 +1387,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    if (force_single_expert) {
+        ggml_tensor * forced_experts_f32 = ggml_fill(
+                ctx0,
+                ggml_cast(ctx0, selected_experts, GGML_TYPE_F32),
+                (float) cparams.moe_force_expert);
+        selected_experts = ggml_cast(ctx0, forced_experts_f32, GGML_TYPE_I32);
+        cb(selected_experts, "ffn_moe_forced_top1", il);
+
+        weights = ggml_fill(ctx0, weights, 1.0f);
+        cb(weights, "ffn_moe_forced_weights", il);
+    }
+
+    if (cparams.moe_router_only) {
+        ggml_tensor * moe_out = ggml_cont(ctx0, ggml_scale(ctx0, cur, 0.0f));
+        cb(moe_out, "ffn_moe_router_only_out", il);
+        return moe_out;
+    }
+
+    ggml_tensor * selected_experts_mm = selected_experts;
+    if (flash_moe_slot_runtime != nullptr && flash_moe_slot_runtime->uses_layer(il)) {
+        if (flash_moe_slot_runtime->uses_native_slot_map(il)) {
+            selected_experts_mm = flash_moe_slot_runtime->build_slot_ids_tensor(ctx0, selected_experts, il);
+            cb(selected_experts_mm, "ffn_moe_slot_ids_native", il);
+        } else {
+            selected_experts_mm = build_inp_moe_slot_ids(il, selected_experts->ne[0], selected_experts->ne[1]);
+            cb(selected_experts_mm, "ffn_moe_slot_ids", il);
+        }
+    }
+
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
@@ -1390,15 +1430,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
+    ggml_tensor * gate_up_merged = nullptr;
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts_mm); // [n_ff*2, n_expert_used, n_tokens]
-        cb(gate_up, "ffn_moe_gate_up", il);
+        gate_up_merged = build_lora_mm_id(gate_up_exps, cur, selected_experts_mm); // [n_ff*2, n_expert_used, n_tokens]
+        cb(gate_up_merged, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts_mm);
-            cb(gate_up, "ffn_moe_gate_up_biased", il);
+            gate_up_merged = ggml_add_id(ctx0, gate_up_merged, gate_up_exps_b, selected_experts_mm);
+            cb(gate_up_merged, "ffn_moe_gate_up_biased", il);
         }
 
         // apply per-expert scale2 to merged gate_up (use up_exps_s since gate and up are fused)
@@ -1406,14 +1447,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
             s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
             s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
-            gate_up = ggml_mul(ctx0, gate_up, s);
-            cb(gate_up, "ffn_moe_gate_up_scaled", il);
+            gate_up_merged = ggml_mul(ctx0, gate_up_merged, s);
+            cb(gate_up_merged, "ffn_moe_gate_up_scaled", il);
         }
 
-        const int64_t n_ff = gate_up->ne[0] / 2;
-        cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+        const int64_t n_ff = gate_up_merged->ne[0] / 2;
+        cur = ggml_view_3d(ctx0, gate_up_merged, n_ff, gate_up_merged->ne[1], gate_up_merged->ne[2], gate_up_merged->nb[1], gate_up_merged->nb[2], 0);
         cb(cur, "ffn_moe_gate", il);
-        up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+        up  = ggml_view_3d(ctx0, gate_up_merged, n_ff, gate_up_merged->ne[1], gate_up_merged->ne[2], gate_up_merged->nb[1], gate_up_merged->nb[2], n_ff * gate_up_merged->nb[0]);
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
@@ -1484,6 +1525,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (has_gate) {
                 cur = ggml_swiglu_split(ctx0, cur, up);
                 cb(cur, "ffn_moe_swiglu", il);
+                if (llama_flash_moe_experimental_metal_split_glu_enabled()) {
+                    ggml_build_forward_expand(gf, cur);
+                }
             } else {
                 cur = ggml_silu(ctx0, cur);
                 cb(cur, "ffn_moe_silu", il);

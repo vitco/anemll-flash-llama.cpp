@@ -160,6 +160,10 @@ target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
+if (LLAMA_FLASH_MOE_GPU_BANK)
+    target_compile_definitions(llama PRIVATE LLAMA_FLASH_MOE_GPU_BANK=1)
+endif()
+
 target_link_libraries(llama PUBLIC ggml)
 
 if (BUILD_SHARED_LIBS)

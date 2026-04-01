@@ -12,6 +12,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +22,22 @@
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+static bool llama_flash_moe_allow_unsafe_resident_bank() {
+    const char * value = std::getenv("LLAMA_FLASH_MOE_ALLOW_UNSAFE_RESIDENT_BANK");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static bool llama_flash_moe_is_routed_tensor_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    return strstr(name, ".ffn_gate_up_exps.") != nullptr ||
+           strstr(name, ".ffn_gate_exps.")    != nullptr ||
+           strstr(name, ".ffn_up_exps.")      != nullptr ||
+           strstr(name, ".ffn_down_exps.")    != nullptr;
+}
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -816,6 +833,7 @@ void llama_model_loader::apply_moe_sidecar_overrides(const std::string & path, b
 
     std::unordered_map<std::string, uint16_t> sidecar_file_indices;
     size_t n_overrides = 0;
+    size_t override_bytes = 0;
 
     for (const auto & entry : *entries_it) {
         if (!entry.is_object()) {
@@ -883,10 +901,24 @@ void llama_model_loader::apply_moe_sidecar_overrides(const std::string & path, b
 
         it_weight->second = llama_tensor_weight(sidecar_idx, repacked_offset, tensor);
         ++n_overrides;
+        override_bytes += tensor_nbytes;
     }
 
-    LLAMA_LOG_INFO("%s: applied Flash-MoE sidecar overrides from %s (%zu tensors across %zu sidecar files)\n",
-            __func__, manifest_path.string().c_str(), n_overrides, sidecar_file_indices.size());
+    static constexpr size_t flash_moe_resident_bank_guard_bytes = 32 * GiB;
+    if (override_bytes > flash_moe_resident_bank_guard_bytes && !llama_flash_moe_allow_unsafe_resident_bank()) {
+        throw std::runtime_error(format(
+            "Flash-MoE resident-bank would make %.2f GiB of routed expert tensors resident through the normal loader path; this exceeds the guarded %.2f GiB limit for end-user safety in this fork. Use --moe-mode slot-bank, or set LLAMA_FLASH_MOE_ALLOW_UNSAFE_RESIDENT_BANK=1 for a supervised manual test",
+            override_bytes / 1024.0 / 1024.0 / 1024.0,
+            flash_moe_resident_bank_guard_bytes / 1024.0 / 1024.0 / 1024.0));
+    }
+
+    LLAMA_LOG_INFO("%s: applied Flash-MoE sidecar overrides from %s (%zu tensors / %.2f GiB across %zu sidecar files)%s\n",
+            __func__, manifest_path.string().c_str(), n_overrides,
+            override_bytes / 1024.0 / 1024.0 / 1024.0,
+            sidecar_file_indices.size(),
+            override_bytes > flash_moe_resident_bank_guard_bytes && llama_flash_moe_allow_unsafe_resident_bank()
+                ? " [UNSAFE resident-bank override]"
+                : "");
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1558,6 +1590,12 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
         n_created++;
     }
 
+    if (llama_flash_moe_is_routed_tensor_name(ggml_get_name(t_meta))) {
+        flash_moe_slot_bank_virtualization_active = true;
+        flash_moe_virtualized_tensors++;
+        flash_moe_virtualized_bytes += ggml_nbytes(tensor);
+    }
+
     weights_map.erase(ggml_get_name(t_meta));
 
     return tensor;
@@ -1653,6 +1691,12 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 }
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
+    if (flash_moe_slot_bank_virtualization_active && llama_flash_moe_is_routed_tensor_name(ggml_get_name(cur))) {
+        throw std::runtime_error(format(
+                "Flash-MoE slot-bank routed tensor '%s' must not be loaded via load_data_for()",
+                ggml_get_name(cur)));
+    }
+
     const auto & w = require_weight(ggml_get_name(cur));
 
     if (use_mmap) {
@@ -1790,8 +1834,26 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    const size_t flash_moe_filtered_load_tensors_before = flash_moe_filtered_load_tensors;
+    const size_t flash_moe_filtered_load_bytes_before   = flash_moe_filtered_load_bytes;
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
-        const auto * weight = get_weight(ggml_get_name(cur));
+        const char * tensor_name = ggml_get_name(cur);
+        const bool is_flash_moe_routed = llama_flash_moe_is_routed_tensor_name(tensor_name);
+        const auto * weight = get_weight(tensor_name);
+
+        if (flash_moe_slot_bank_virtualization_active && is_flash_moe_routed) {
+            if (weight != nullptr) {
+                throw std::runtime_error(format(
+                        "Flash-MoE slot-bank routed tensor '%s' unexpectedly remained in GGUF weights_map during load_all_data()",
+                        tensor_name));
+            }
+
+            flash_moe_filtered_load_tensors++;
+            flash_moe_filtered_load_bytes += ggml_nbytes(cur);
+            continue;
+        }
+
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
@@ -1911,6 +1973,15 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    if (flash_moe_slot_bank_virtualization_active) {
+        const size_t filtered_tensors = flash_moe_filtered_load_tensors - flash_moe_filtered_load_tensors_before;
+        const size_t filtered_bytes   = flash_moe_filtered_load_bytes   - flash_moe_filtered_load_bytes_before;
+        if (filtered_tensors > 0) {
+            LLAMA_LOG_INFO("%s: Flash-MoE slot-bank filtered %zu routed tensors (%.2f GiB) out of GGUF tensor data loading for this context\n",
+                    __func__, filtered_tensors, filtered_bytes / 1024.0 / 1024.0 / 1024.0);
+        }
     }
 
     // free temporary resources used for async uploads

@@ -639,9 +639,15 @@ struct common_params {
     std::string moe_mode      = "stock"; // Flash-MoE runtime mode                                     // NOLINT
     std::string moe_trace     = "";      // reserved trace output path                                 // NOLINT
     std::string moe_quant_map = "";      // reserved dynamic-quant policy path                         // NOLINT
+    std::string oracle_dump   = "";      // llama-cli tensor oracle dump directory                     // NOLINT
     int32_t     moe_slot_bank = 0;       // reserved slot-bank size                                    // NOLINT
     int32_t     moe_topk_override = 0;   // runtime reduction-only routed-expert override              // NOLINT
+    int32_t     moe_cache_io_split = 1;  // split each routed expert pread into N aligned chunks       // NOLINT
+    int32_t     moe_force_expert = -1;   // force routed selection to a single expert id              // NOLINT
+    int32_t     oracle_topk = 32;        // number of final logits to retain in oracle manifests       // NOLINT
     bool        moe_prefetch_temporal = false; // runtime temporal prefetch for slot-bank              // NOLINT
+    bool        moe_shared_only = false; // bypass routed experts and keep shared experts only         // NOLINT
+    bool        moe_router_only = false; // keep routing/topk, bypass routed expert matmuls           // NOLINT
     bool        moe_trace_harness = false; // llama-cli raw non-interactive harness for long traces    // NOLINT
 
     // retrieval params

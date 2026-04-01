@@ -13,20 +13,29 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
+#include <future>
 #include <fcntl.h>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unistd.h>
 
 //
 // llama_context
 //
+
+static bool flash_moe_backend_trace_enabled();
+static void flash_moe_log_routed_backends(struct ggml_cgraph * gf, ggml_backend_sched_t sched);
 
 class llama_flash_moe_slot_runtime : public llm_flash_moe_slot_runtime_i {
 public:
@@ -37,7 +46,10 @@ public:
               resident_bank_source(model.flash_moe_resident_source_enabled()),
               oracle_all_hit(model.flash_moe_oracle_all_hit_enabled()),
               oracle_prefetch(model.flash_moe_oracle_prefetch_enabled()),
-              temporal_prefetch(model.flash_moe_temporal_prefetch_enabled()) {
+              temporal_prefetch(model.flash_moe_temporal_prefetch_enabled()),
+              async_slot_upload(async_slot_upload_enabled()),
+              parallel_slot_reads(parallel_slot_reads_enabled()),
+              cache_io_split(std::max<int32_t>(model.flash_moe_cache_io_split(), cache_io_split_from_env())) {
         if (const char * path = model.flash_moe_trace_file(); oracle_all_hit || oracle_prefetch) {
             if (path == nullptr || path[0] == '\0') {
                 throw std::runtime_error("Flash-MoE oracle replay mode requires a replay trace file");
@@ -81,9 +93,43 @@ public:
             preload_resident_banks();
             resident_full_bank_pending = slot_count == expert_count;
         }
+
+        if (parallel_slot_reads || cache_io_split > 1) {
+            start_read_pool();
+        }
+
+        if (cache_io_split > 1) {
+            LLAMA_LOG_INFO("%s: Flash-MoE routed installs will split expert preads into %d page-aligned chunks\n",
+                    __func__, cache_io_split);
+        }
+
+        if (oracle_all_hit && !model.hparams.no_alloc) {
+            // Prime the replayed resident set during runtime construction so oracle-all-hit
+            // acts as a true hit-only decode path instead of charging installs to the first
+            // measured routed calls.
+            prime_oracle_trace();
+        }
     }
 
     ~llama_flash_moe_slot_runtime() override {
+        stop_read_pool();
+        for (auto & [_, uploader] : async_uploaders) {
+            for (auto & buffer : uploader.buffers) {
+                if (buffer.pending) {
+                    ggml_backend_event_synchronize(buffer.event);
+                    buffer.pending = false;
+                }
+                if (buffer.event != nullptr) {
+                    ggml_backend_event_free(buffer.event);
+                }
+                if (buffer.host_buffer != nullptr) {
+                    ggml_backend_buffer_free(buffer.host_buffer);
+                }
+            }
+            if (uploader.backend != nullptr) {
+                ggml_backend_free(uploader.backend);
+            }
+        }
         if (trace_fp != nullptr) {
             std::fclose(trace_fp);
         }
@@ -175,6 +221,7 @@ public:
                 oracle_prime_stats.install_us += install.install_us;
                 oracle_prime_stats.source_us += install.source_us;
                 oracle_prime_stats.upload_us += install.upload_us;
+                accumulate_install_breakdown(oracle_prime_stats, install);
                 oracle_prime_stats.total_us += install.install_us;
                 state.slot_age[slot] = ++age;
             }
@@ -368,9 +415,12 @@ private:
         state.stats.bytes_loaded += install.bytes;
         state.stats.pread_ops += install.pread_ops;
         state.stats.resident_copy_ops += install.resident_copy_ops;
+        state.stats.cold_loads += install.cold_loads;
+        state.stats.evict_loads += install.evict_loads;
         state.stats.install_us += install.install_us;
         state.stats.source_us += install.source_us;
         state.stats.upload_us += install.upload_us;
+        accumulate_install_breakdown(state.stats, install);
 
         for (const int32_t slot : touched_slots) {
             state.slot_age[slot] = ++age;
@@ -398,9 +448,19 @@ private:
         size_t  bytes = 0;
         size_t  pread_ops = 0;
         size_t  resident_copy_ops = 0;
+        size_t  cold_loads = 0;
+        size_t  evict_loads = 0;
         int64_t source_us = 0;
         int64_t upload_us = 0;
         int64_t install_us = 0;
+        int64_t gate_up_install_us = 0;
+        int64_t gate_install_us = 0;
+        int64_t up_install_us = 0;
+        int64_t down_install_us = 0;
+        uint64_t gate_up_bytes = 0;
+        uint64_t gate_bytes = 0;
+        uint64_t up_bytes = 0;
+        uint64_t down_bytes = 0;
     };
 
     struct routed_metrics {
@@ -412,6 +472,8 @@ private:
         uint64_t bytes_loaded = 0;
         uint64_t pread_ops = 0;
         uint64_t resident_copy_ops = 0;
+        uint64_t cold_loads = 0;
+        uint64_t evict_loads = 0;
         int64_t total_us = 0;
         int64_t topk_read_us = 0;
         int64_t slot_resolve_us = 0;
@@ -420,10 +482,83 @@ private:
         int64_t upload_us = 0;
         int64_t slot_write_us = 0;
         int64_t trace_write_us = 0;
+        int64_t gate_up_install_us = 0;
+        int64_t gate_install_us = 0;
+        int64_t up_install_us = 0;
+        int64_t down_install_us = 0;
+        uint64_t gate_up_bytes = 0;
+        uint64_t gate_bytes = 0;
+        uint64_t up_bytes = 0;
+        uint64_t down_bytes = 0;
     };
 
     struct resident_bank_file {
         std::vector<uint8_t> data;
+    };
+
+    struct async_upload_buffer_state {
+        ggml_backend_buffer_t host_buffer = nullptr;
+        ggml_backend_event_t event = nullptr;
+        void * host_ptr = nullptr;
+        bool pending = false;
+    };
+
+    struct async_slot_uploader {
+        ggml_backend_t backend = nullptr;
+        ggml_backend_dev_t dev = nullptr;
+        size_t buffer_size = 0;
+        size_t next_buffer = 0;
+        std::vector<async_upload_buffer_state> buffers;
+    };
+
+    enum class routed_family : uint8_t {
+        gate_up,
+        gate,
+        up,
+        down,
+    };
+
+    struct install_chunk {
+        ggml_tensor * tensor = nullptr;
+        const llama_flash_moe_sidecar_entry * entry = nullptr;
+        routed_family family = routed_family::gate;
+        int32_t expert = -1;
+        int32_t slot = -1;
+        size_t task_begin = 0;
+        int32_t task_count = 0;
+        std::vector<uint8_t> bytes;
+    };
+
+    struct pending_slot_load {
+        int32_t expert = -1;
+        int32_t slot = -1;
+    };
+
+    struct pread_result {
+        ssize_t result = 0;
+        int64_t elapsed_us = 0;
+    };
+
+    struct pread_task {
+        int fd = -1;
+        void * dst = nullptr;
+        off_t offset = 0;
+        size_t size = 0;
+        ssize_t result = 0;
+        int64_t elapsed_us = 0;
+    };
+
+    struct read_thread_pool {
+        std::mutex mutex;
+        std::condition_variable work_ready;
+        std::condition_variable work_done;
+        std::vector<std::thread> workers;
+        pread_task * tasks = nullptr;
+        int num_tasks = 0;
+        int tasks_completed = 0;
+        int generation = 0;
+        int completed_generation = 0;
+        bool shutdown = false;
     };
 
     struct layer_state {
@@ -448,6 +583,8 @@ private:
         std::vector<uint32_t> request_seen_epoch;
         std::vector<int32_t>  request_slot;
         std::vector<int32_t>  temporal_prefetch_experts;
+        int32_t resident_count = 0;
+        int32_t peak_resident_count = 0;
         routed_metrics stats;
     };
 
@@ -461,16 +598,23 @@ private:
     bool oracle_all_hit = false;
     bool oracle_prefetch = false;
     bool temporal_prefetch = false;
+    bool async_slot_upload = false;
+    bool parallel_slot_reads = false;
+    int32_t cache_io_split = 1;
     bool oracle_primed = false;
     bool oracle_prefetch_primed = false;
     size_t oracle_prefetch_repairs = 0;
+    size_t async_slot_upload_buffer_size = 0;
     routed_metrics resident_prime_stats;
     routed_metrics prefetch_stats;
     routed_metrics oracle_prime_stats;
     std::vector<native_slot_map_userdata> native_slot_map_ud;
     std::vector<layer_state> layers;
+    std::mutex fds_mutex;
     std::unordered_map<std::string, int> fds;
     std::unordered_map<std::string, resident_bank_file> resident_banks;
+    std::unordered_map<ggml_backend_dev_t, async_slot_uploader> async_uploaders;
+    read_thread_pool read_pool;
     std::vector<int32_t> topk_ids;
     std::vector<int32_t> slot_ids;
     std::vector<int32_t> touched_slots;
@@ -488,6 +632,153 @@ private:
     static bool native_slot_map_disabled() {
         const char * value = std::getenv("LLAMA_FLASH_MOE_DISABLE_NATIVE_SLOT_MAP");
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    static bool async_slot_upload_enabled() {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_ASYNC_SLOT_UPLOAD");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    static bool parallel_slot_reads_enabled() {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    static bool batched_install_reads_enabled() {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_BATCHED_INSTALL_READS");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    static int32_t cache_io_split_from_env() {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_CACHE_IO_SPLIT");
+        if (value == nullptr || value[0] == '\0') {
+            return 1;
+        }
+        return std::max(1, std::atoi(value));
+    }
+
+    static bool cpu_visible_slot_writes_enabled() {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    static constexpr int32_t flash_moe_page_bytes = 16 * 1024;
+    static constexpr int32_t flash_moe_max_cache_io_split = 8;
+
+    static int32_t active_cache_io_split(size_t bytes_per_expert, int32_t requested_split) {
+        int32_t chunks = std::max<int32_t>(1, requested_split);
+        chunks = std::min<int32_t>(chunks, flash_moe_max_cache_io_split);
+        if (bytes_per_expert == 0 || (bytes_per_expert % flash_moe_page_bytes) != 0) {
+            return 1;
+        }
+
+        const size_t pages = bytes_per_expert / flash_moe_page_bytes;
+        if ((size_t) chunks > pages) {
+            chunks = (int32_t) pages;
+        }
+        return std::max<int32_t>(1, chunks);
+    }
+
+    void start_read_pool() {
+        if (!read_pool.workers.empty()) {
+            return;
+        }
+
+        constexpr size_t n_workers = 8;
+        read_pool.shutdown = false;
+        read_pool.tasks = nullptr;
+        read_pool.num_tasks = 0;
+        read_pool.tasks_completed = 0;
+        read_pool.generation = 0;
+        read_pool.completed_generation = 0;
+        read_pool.workers.reserve(n_workers);
+        for (size_t idx = 0; idx < n_workers; ++idx) {
+            read_pool.workers.emplace_back([this, idx]() {
+                int my_generation = 0;
+                while (true) {
+                    pread_task * tasks = nullptr;
+                    int num_tasks = 0;
+                    {
+                        std::unique_lock<std::mutex> lock(read_pool.mutex);
+                        read_pool.work_ready.wait(lock, [this, my_generation]() {
+                            return read_pool.shutdown || read_pool.generation != my_generation;
+                        });
+                        if (read_pool.shutdown) {
+                            return;
+                        }
+                        my_generation = read_pool.generation;
+                        tasks = read_pool.tasks;
+                        num_tasks = read_pool.num_tasks;
+                    }
+
+                    const int worker_count = int(read_pool.workers.size());
+                    for (int task_idx = int(idx); task_idx < num_tasks; task_idx += worker_count) {
+                        pread_task & task = tasks[task_idx];
+                        const int64_t t_start_us = ggml_time_us();
+                        task.result = pread(task.fd, task.dst, task.size, task.offset);
+                        task.elapsed_us = ggml_time_us() - t_start_us;
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(read_pool.mutex);
+                        read_pool.tasks_completed++;
+                        if (read_pool.tasks_completed == int(n_workers)) {
+                            read_pool.completed_generation = my_generation;
+                            read_pool.work_done.notify_one();
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    void stop_read_pool() {
+        {
+            std::lock_guard<std::mutex> lock(read_pool.mutex);
+            read_pool.shutdown = true;
+        }
+        read_pool.work_ready.notify_all();
+        for (auto & worker : read_pool.workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        read_pool.workers.clear();
+        read_pool.tasks = nullptr;
+        read_pool.num_tasks = 0;
+        read_pool.tasks_completed = 0;
+    }
+
+    void execute_pread_tasks(std::vector<pread_task> & tasks) {
+        if (tasks.empty()) {
+            return;
+        }
+
+        if (read_pool.workers.empty()) {
+            for (auto & task : tasks) {
+                const int64_t t_start_us = ggml_time_us();
+                task.result = pread(task.fd, task.dst, task.size, task.offset);
+                task.elapsed_us = ggml_time_us() - t_start_us;
+            }
+            return;
+        }
+
+        int generation = 0;
+        {
+            std::lock_guard<std::mutex> lock(read_pool.mutex);
+            read_pool.tasks = tasks.data();
+            read_pool.num_tasks = int(tasks.size());
+            read_pool.tasks_completed = 0;
+            read_pool.generation++;
+            generation = read_pool.generation;
+        }
+
+        read_pool.work_ready.notify_all();
+
+        std::unique_lock<std::mutex> lock(read_pool.mutex);
+        read_pool.work_done.wait(lock, [this, generation]() {
+            return read_pool.completed_generation >= generation || read_pool.shutdown;
+        });
     }
 
     const oracle_record & next_oracle_record(int layer, int64_t n_expert_used, int64_t n_tokens) {
@@ -674,10 +965,13 @@ private:
         prefetch_stats.bytes_loaded += install.bytes;
         prefetch_stats.pread_ops += install.pread_ops;
         prefetch_stats.resident_copy_ops += install.resident_copy_ops;
+        prefetch_stats.cold_loads += install.cold_loads;
+        prefetch_stats.evict_loads += install.evict_loads;
         prefetch_stats.total_us += ggml_time_us() - t_prefetch_start_us;
         prefetch_stats.install_us += install.install_us;
         prefetch_stats.source_us += install.source_us;
         prefetch_stats.upload_us += install.upload_us;
+        accumulate_install_breakdown(prefetch_stats, install);
     }
 
     void prime_oracle_prefetch_record(size_t record_index, const std::vector<int32_t> * protected_slots) {
@@ -748,9 +1042,12 @@ private:
         prefetch_stats.bytes_loaded += install.bytes;
         prefetch_stats.pread_ops += install.pread_ops;
         prefetch_stats.resident_copy_ops += install.resident_copy_ops;
+        prefetch_stats.cold_loads += install.cold_loads;
+        prefetch_stats.evict_loads += install.evict_loads;
         prefetch_stats.install_us += install.install_us;
         prefetch_stats.source_us += install.source_us;
         prefetch_stats.upload_us += install.upload_us;
+        accumulate_install_breakdown(prefetch_stats, install);
         prefetch_stats.total_us += ggml_time_us() - t_prefetch_start_us;
     }
 
@@ -778,6 +1075,140 @@ private:
         tensor_out = tensor;
         entry_out = entry;
         enabled_out = true;
+        async_slot_upload_buffer_size = std::max(async_slot_upload_buffer_size, entry->bytes_per_expert);
+    }
+
+    void destroy_async_uploader(async_slot_uploader & uploader) {
+        for (auto & buffer : uploader.buffers) {
+            if (buffer.pending) {
+                ggml_backend_event_synchronize(buffer.event);
+                buffer.pending = false;
+            }
+            if (buffer.event != nullptr) {
+                ggml_backend_event_free(buffer.event);
+                buffer.event = nullptr;
+            }
+            if (buffer.host_buffer != nullptr) {
+                ggml_backend_buffer_free(buffer.host_buffer);
+                buffer.host_buffer = nullptr;
+            }
+            buffer.host_ptr = nullptr;
+        }
+
+        uploader.buffers.clear();
+
+        if (uploader.backend != nullptr) {
+            ggml_backend_free(uploader.backend);
+            uploader.backend = nullptr;
+        }
+
+        uploader.dev = nullptr;
+        uploader.buffer_size = 0;
+        uploader.next_buffer = 0;
+    }
+
+    async_slot_uploader * get_async_uploader(ggml_tensor * tensor, size_t required_size) {
+        if (!async_slot_upload || required_size == 0) {
+            return nullptr;
+        }
+
+        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (buf == nullptr || tensor->data == nullptr || tensor_cpu_visible_data(tensor) != nullptr) {
+            return nullptr;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev == nullptr) {
+            return nullptr;
+        }
+
+        if (buft != ggml_backend_dev_buffer_type(dev)) {
+            return nullptr;
+        }
+
+        auto it = async_uploaders.find(dev);
+        if (it != async_uploaders.end()) {
+            return it->second.buffer_size >= required_size ? &it->second : nullptr;
+        }
+
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
+            return nullptr;
+        }
+
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft == nullptr) {
+            return nullptr;
+        }
+
+        async_slot_uploader uploader;
+        uploader.dev = dev;
+        uploader.buffer_size = std::max(async_slot_upload_buffer_size, required_size);
+        uploader.backend = ggml_backend_dev_init(dev, nullptr);
+        if (uploader.backend == nullptr) {
+            return nullptr;
+        }
+
+        constexpr size_t n_buffers = 8;
+        uploader.buffers.reserve(n_buffers);
+        for (size_t idx = 0; idx < n_buffers; ++idx) {
+            async_upload_buffer_state buffer;
+            buffer.host_buffer = ggml_backend_buft_alloc_buffer(host_buft, uploader.buffer_size);
+            if (buffer.host_buffer == nullptr) {
+                destroy_async_uploader(uploader);
+                return nullptr;
+            }
+            buffer.host_ptr = ggml_backend_buffer_get_base(buffer.host_buffer);
+            if (buffer.host_ptr == nullptr) {
+                destroy_async_uploader(uploader);
+                return nullptr;
+            }
+            buffer.event = ggml_backend_event_new(dev);
+            if (buffer.event == nullptr) {
+                destroy_async_uploader(uploader);
+                return nullptr;
+            }
+            uploader.buffers.emplace_back(buffer);
+        }
+
+        LLAMA_LOG_INFO("%s: Flash-MoE async slot uploads enabled for device %s with %zu pinned buffers of %.2f MiB each\n",
+                __func__, ggml_backend_dev_name(dev), uploader.buffers.size(), uploader.buffer_size / 1024.0 / 1024.0);
+
+        auto [inserted_it, inserted] = async_uploaders.emplace(dev, std::move(uploader));
+        GGML_ASSERT(inserted);
+        return &inserted_it->second;
+    }
+
+    int64_t flush_async_uploads() {
+        int64_t wait_us = 0;
+
+        for (auto & [_, uploader] : async_uploaders) {
+            for (auto & buffer : uploader.buffers) {
+                if (!buffer.pending) {
+                    continue;
+                }
+
+                const int64_t t_wait_start_us = ggml_time_us();
+                ggml_backend_event_synchronize(buffer.event);
+                wait_us += ggml_time_us() - t_wait_start_us;
+                buffer.pending = false;
+            }
+        }
+
+        return wait_us;
+    }
+
+    void accumulate_install_breakdown(routed_metrics & dst, const install_metrics & src) const {
+        dst.gate_up_install_us += src.gate_up_install_us;
+        dst.gate_install_us += src.gate_install_us;
+        dst.up_install_us += src.up_install_us;
+        dst.down_install_us += src.down_install_us;
+        dst.gate_up_bytes += src.gate_up_bytes;
+        dst.gate_bytes += src.gate_bytes;
+        dst.up_bytes += src.up_bytes;
+        dst.down_bytes += src.down_bytes;
     }
 
     void accumulate_metrics(routed_metrics & dst, const routed_metrics & src) const {
@@ -789,6 +1220,8 @@ private:
         dst.bytes_loaded += src.bytes_loaded;
         dst.pread_ops += src.pread_ops;
         dst.resident_copy_ops += src.resident_copy_ops;
+        dst.cold_loads += src.cold_loads;
+        dst.evict_loads += src.evict_loads;
         dst.total_us += src.total_us;
         dst.topk_read_us += src.topk_read_us;
         dst.slot_resolve_us += src.slot_resolve_us;
@@ -797,6 +1230,14 @@ private:
         dst.upload_us += src.upload_us;
         dst.slot_write_us += src.slot_write_us;
         dst.trace_write_us += src.trace_write_us;
+        dst.gate_up_install_us += src.gate_up_install_us;
+        dst.gate_install_us += src.gate_install_us;
+        dst.up_install_us += src.up_install_us;
+        dst.down_install_us += src.down_install_us;
+        dst.gate_up_bytes += src.gate_up_bytes;
+        dst.gate_bytes += src.gate_bytes;
+        dst.up_bytes += src.up_bytes;
+        dst.down_bytes += src.down_bytes;
     }
 
     void preload_resident_banks() {
@@ -870,9 +1311,12 @@ private:
             resident_prime_stats.bytes_loaded += install.bytes;
             resident_prime_stats.pread_ops += install.pread_ops;
             resident_prime_stats.resident_copy_ops += install.resident_copy_ops;
+            resident_prime_stats.cold_loads += install.cold_loads;
+            resident_prime_stats.evict_loads += install.evict_loads;
             resident_prime_stats.install_us += install.install_us;
             resident_prime_stats.source_us += install.source_us;
             resident_prime_stats.upload_us += install.upload_us;
+            accumulate_install_breakdown(resident_prime_stats, install);
             resident_prime_stats.total_us += install.install_us;
 
             for (int32_t slot = 0; slot < state.n_slots; ++slot) {
@@ -906,7 +1350,7 @@ private:
         const double miss_bytes_gib = total.bytes_loaded / 1024.0 / 1024.0 / 1024.0;
         const int64_t other_us = total.total_us - total.topk_read_us - total.slot_resolve_us - total.install_us - total.slot_write_us - total.trace_write_us;
 
-        LLAMA_LOG_INFO("%s: Flash-MoE routed summary source=%s calls=%" PRIu64 " refs=%" PRIu64 " unique=%" PRIu64 " hit=%.1f%% misses/call=%.2f bytes=%.2f GiB topk=%.3f ms resolve=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms slot-write=%.3f ms trace=%.3f ms other=%.3f ms pread_ops=%" PRIu64 " resident_copy_ops=%" PRIu64 "\n",
+        LLAMA_LOG_INFO("%s: Flash-MoE routed summary source=%s calls=%" PRIu64 " refs=%" PRIu64 " unique=%" PRIu64 " hit=%.1f%% misses/call=%.2f bytes=%.2f GiB topk=%.3f ms resolve=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms slot-write=%.3f ms trace=%.3f ms other=%.3f ms pread_ops=%" PRIu64 " resident_copy_ops=%" PRIu64 " io-split=%d async-upload=%s parallel-reads=%s cpu-visible-slot-writes=%s\n",
                 __func__,
                 resident_bank_source ? "resident-packed" :
                 oracle_all_hit ? "oracle-all-hit" :
@@ -915,7 +1359,21 @@ private:
                 total.topk_read_us / 1000.0, total.slot_resolve_us / 1000.0, total.install_us / 1000.0,
                 total.source_us / 1000.0, total.upload_us / 1000.0, total.slot_write_us / 1000.0,
                 total.trace_write_us / 1000.0, std::max<int64_t>(0, other_us) / 1000.0,
-                total.pread_ops, total.resident_copy_ops);
+                total.pread_ops, total.resident_copy_ops,
+                cache_io_split,
+                async_slot_upload ? "on" : "off",
+                parallel_slot_reads ? "on" : "off",
+                cpu_visible_slot_writes_enabled() ? "on" : "off");
+        if (total.bytes_loaded > 0 || total.gate_up_install_us > 0 || total.gate_install_us > 0 || total.up_install_us > 0 || total.down_install_us > 0) {
+            LLAMA_LOG_INFO("%s: Flash-MoE install breakdown gate_up=%.3f ms / %.2f GiB gate=%.3f ms / %.2f GiB up=%.3f ms / %.2f GiB down=%.3f ms / %.2f GiB\n",
+                    __func__,
+                    total.gate_up_install_us / 1000.0, total.gate_up_bytes / 1024.0 / 1024.0 / 1024.0,
+                    total.gate_install_us / 1000.0, total.gate_bytes / 1024.0 / 1024.0 / 1024.0,
+                    total.up_install_us / 1000.0, total.up_bytes / 1024.0 / 1024.0 / 1024.0,
+                    total.down_install_us / 1000.0, total.down_bytes / 1024.0 / 1024.0 / 1024.0);
+        }
+        LLAMA_LOG_INFO("%s: Flash-MoE residency summary cold-loads=%" PRIu64 " evict-loads=%" PRIu64 "\n",
+                __func__, total.cold_loads, total.evict_loads);
 
         if (prefetch_stats.calls > 0) {
             const double prefetch_hit_pct = prefetch_stats.unique_experts > 0 ?
@@ -960,9 +1418,16 @@ private:
         for (size_t i = 0; i < top_layers; ++i) {
             const auto & [layer, stats] = layer_metrics[i];
             const double layer_hit_pct = stats.unique_experts > 0 ? 100.0 * double(stats.hit_experts) / double(stats.unique_experts) : 0.0;
-            LLAMA_LOG_DEBUG("%s: Flash-MoE layer %d calls=%" PRIu64 " unique=%" PRIu64 " hit=%.1f%% misses=%" PRIu64 " bytes=%.2f MiB topk=%.3f ms resolve=%.3f ms install=%.3f ms slot-write=%.3f ms trace=%.3f ms\n",
+            LLAMA_LOG_INFO("%s: Flash-MoE layer-residency layer=%d calls=%" PRIu64 " unique=%" PRIu64 " hit=%.1f%% misses=%" PRIu64 " cold=%" PRIu64 " evict=%" PRIu64 " resident-peak=%d bytes=%.2f MiB install=%.3f ms\n",
                     __func__,
                     layer, stats.calls, stats.unique_experts, layer_hit_pct, stats.miss_experts,
+                    stats.cold_loads, stats.evict_loads, layers[layer].peak_resident_count,
+                    stats.bytes_loaded / 1024.0 / 1024.0,
+                    stats.install_us / 1000.0);
+            LLAMA_LOG_DEBUG("%s: Flash-MoE layer %d calls=%" PRIu64 " unique=%" PRIu64 " hit=%.1f%% misses=%" PRIu64 " cold=%" PRIu64 " evict=%" PRIu64 " resident-peak=%d bytes=%.2f MiB topk=%.3f ms resolve=%.3f ms install=%.3f ms slot-write=%.3f ms trace=%.3f ms\n",
+                    __func__,
+                    layer, stats.calls, stats.unique_experts, layer_hit_pct, stats.miss_experts,
+                    stats.cold_loads, stats.evict_loads, layers[layer].peak_resident_count,
                     stats.bytes_loaded / 1024.0 / 1024.0,
                     stats.topk_read_us / 1000.0, stats.slot_resolve_us / 1000.0,
                     stats.install_us / 1000.0, stats.slot_write_us / 1000.0, stats.trace_write_us / 1000.0);
@@ -970,6 +1435,7 @@ private:
     }
 
     int fd_for(const std::string & path) {
+        std::lock_guard<std::mutex> lock(fds_mutex);
         auto it = fds.find(path);
         if (it != fds.end()) {
             return it->second;
@@ -1034,8 +1500,50 @@ private:
         return static_cast<uint8_t *>(tensor->data);
     }
 
+    static uint8_t * tensor_cpu_visible_data(ggml_tensor * tensor) {
+        if (tensor == nullptr || tensor->data == nullptr) {
+            return nullptr;
+        }
+
+        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (buf == nullptr) {
+            return nullptr;
+        }
+
+        if (ggml_backend_buffer_is_host(buf)) {
+            return static_cast<uint8_t *>(tensor->data);
+        }
+
+        if (cpu_visible_slot_writes_enabled() && ggml_backend_buffer_get_base(buf) != nullptr) {
+            return static_cast<uint8_t *>(tensor->data);
+        }
+
+        return nullptr;
+    }
+
     static const uint8_t * tensor_host_data(const ggml_tensor * tensor) {
         return tensor_host_data(const_cast<ggml_tensor *>(tensor));
+    }
+
+    static void add_family_install(install_metrics & metrics, routed_family family, int64_t install_us, uint64_t bytes) {
+        switch (family) {
+            case routed_family::gate_up:
+                metrics.gate_up_install_us += install_us;
+                metrics.gate_up_bytes += bytes;
+                break;
+            case routed_family::gate:
+                metrics.gate_install_us += install_us;
+                metrics.gate_bytes += bytes;
+                break;
+            case routed_family::up:
+                metrics.up_install_us += install_us;
+                metrics.up_bytes += bytes;
+                break;
+            case routed_family::down:
+                metrics.down_install_us += install_us;
+                metrics.down_bytes += bytes;
+                break;
+        }
     }
 
     void read_topk_ids_tensor(const ggml_tensor * tensor, int64_t n_expert_used, int64_t n_tokens) {
@@ -1072,71 +1580,168 @@ private:
         ggml_backend_tensor_set(tensor, values.data(), 0, bytes);
     }
 
-    install_metrics load_into_slot(
-            ggml_tensor * tensor,
+    install_metrics read_expert_bytes(
             const llama_flash_moe_sidecar_entry * entry,
             int32_t expert,
-            int32_t slot) {
+            uint8_t * out) {
         install_metrics metrics;
-        if (tensor == nullptr || entry == nullptr) {
+        if (entry == nullptr || out == nullptr) {
             return metrics;
         }
 
         const off_t offset = static_cast<off_t>(entry->repacked_offset + size_t(expert) * entry->bytes_per_expert);
         metrics.bytes = entry->bytes_per_expert;
+        const int64_t t_read_start_us = ggml_time_us();
 
-        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-        uint8_t * dst = nullptr;
-        if (buf != nullptr && ggml_backend_buffer_is_host(buf) && tensor->data != nullptr) {
-            dst = static_cast<uint8_t *>(tensor->data) + size_t(slot) * entry->bytes_per_expert;
-        }
-
-        auto copy_from_source = [&](uint8_t * out) {
-            if (resident_bank_source) {
-                auto it = resident_banks.find(entry->repacked_path);
-                if (it == resident_banks.end()) {
-                    throw std::runtime_error(format(
-                        "missing Flash-MoE resident packed bank '%s'",
-                        entry->repacked_path.c_str()));
-                }
-
-                const auto & bank = it->second.data;
-                const size_t copy_offset = static_cast<size_t>(offset);
-                if (copy_offset + entry->bytes_per_expert > bank.size()) {
-                    throw std::runtime_error(format(
-                        "Flash-MoE resident packed bank '%s' is too small for tensor '%s' expert %d",
-                        entry->repacked_path.c_str(), entry->tensor_name.c_str(), expert));
-                }
-
-                const int64_t t_source_start_us = ggml_time_us();
-                std::memcpy(out, bank.data() + copy_offset, entry->bytes_per_expert);
-                metrics.source_us += ggml_time_us() - t_source_start_us;
-                metrics.resident_copy_ops++;
-                return;
+        if (resident_bank_source) {
+            auto it = resident_banks.find(entry->repacked_path);
+            if (it == resident_banks.end()) {
+                throw std::runtime_error(format(
+                    "missing Flash-MoE resident packed bank '%s'",
+                    entry->repacked_path.c_str()));
             }
 
-            const int64_t t_source_start_us = ggml_time_us();
-            const ssize_t n_read = pread(fd_for(entry->repacked_path), out, entry->bytes_per_expert, offset);
-            metrics.source_us += ggml_time_us() - t_source_start_us;
+            const auto & bank = it->second.data;
+            const size_t copy_offset = static_cast<size_t>(offset);
+            if (copy_offset + entry->bytes_per_expert > bank.size()) {
+                throw std::runtime_error(format(
+                    "Flash-MoE resident packed bank '%s' is too small for tensor '%s' expert %d",
+                    entry->repacked_path.c_str(), entry->tensor_name.c_str(), expert));
+            }
+
+            std::memcpy(out, bank.data() + copy_offset, entry->bytes_per_expert);
+            metrics.source_us += ggml_time_us() - t_read_start_us;
+            metrics.resident_copy_ops++;
+            metrics.install_us += metrics.source_us;
+            return metrics;
+        }
+
+        const int fd = fd_for(entry->repacked_path);
+        const int32_t chunks = active_cache_io_split(entry->bytes_per_expert, cache_io_split);
+
+        if (chunks <= 1) {
+            const ssize_t n_read = pread(fd, out, entry->bytes_per_expert, offset);
+            metrics.source_us += ggml_time_us() - t_read_start_us;
             metrics.pread_ops++;
             if (n_read != (ssize_t) entry->bytes_per_expert) {
                 throw std::runtime_error(format(
                     "failed to read expert %d for tensor '%s' from '%s'",
                     expert, entry->tensor_name.c_str(), entry->repacked_path.c_str()));
             }
-        };
+        } else {
+            const size_t total_pages = entry->bytes_per_expert / flash_moe_page_bytes;
+            size_t page_cursor = 0;
+            ssize_t total_read = 0;
+            std::vector<pread_task> tasks;
+            tasks.reserve(chunks);
 
-        if (dst != nullptr) {
-            copy_from_source(dst);
+            for (int32_t chunk = 0; chunk < chunks; ++chunk) {
+                size_t pages_this_chunk = total_pages / (size_t) chunks;
+                if ((size_t) chunk < (total_pages % (size_t) chunks)) {
+                    pages_this_chunk++;
+                }
+                const size_t chunk_offset = page_cursor * flash_moe_page_bytes;
+                const size_t chunk_size = pages_this_chunk * flash_moe_page_bytes;
+                page_cursor += pages_this_chunk;
+
+                tasks.push_back({
+                        fd,
+                        out + chunk_offset,
+                        offset + (off_t) chunk_offset,
+                        chunk_size,
+                        0,
+                        0,
+                });
+            }
+
+            execute_pread_tasks(tasks);
+
+            for (const auto & task : tasks) {
+                metrics.pread_ops++;
+                metrics.source_us += task.elapsed_us;
+                if (task.result > 0) {
+                    total_read += task.result;
+                }
+            }
+
+            if (total_read != (ssize_t) entry->bytes_per_expert) {
+                throw std::runtime_error(format(
+                    "failed to split-read expert %d for tensor '%s' from '%s'",
+                    expert, entry->tensor_name.c_str(), entry->repacked_path.c_str()));
+            }
+        }
+
+        metrics.install_us += metrics.source_us;
+        return metrics;
+    }
+
+    install_metrics upload_expert_bytes(
+            ggml_tensor * tensor,
+            const llama_flash_moe_sidecar_entry * entry,
+            int32_t slot,
+            const uint8_t * src) {
+        install_metrics metrics;
+        if (tensor == nullptr || entry == nullptr || src == nullptr) {
+            return metrics;
+        }
+
+        const int64_t t_upload_start_us = ggml_time_us();
+        if (uint8_t * base = tensor_cpu_visible_data(tensor)) {
+            uint8_t * dst = base + size_t(slot) * entry->bytes_per_expert;
+            std::memcpy(dst, src, entry->bytes_per_expert);
+            metrics.install_us += ggml_time_us() - t_upload_start_us;
+            return metrics;
+        }
+
+        if (async_slot_uploader * uploader = get_async_uploader(tensor, entry->bytes_per_expert)) {
+            auto & buffer = uploader->buffers[uploader->next_buffer];
+
+            if (buffer.pending) {
+                const int64_t t_wait_start_us = ggml_time_us();
+                ggml_backend_event_synchronize(buffer.event);
+                metrics.upload_us += ggml_time_us() - t_wait_start_us;
+                buffer.pending = false;
+            }
+
+            std::memcpy(buffer.host_ptr, src, entry->bytes_per_expert);
+            ggml_backend_tensor_set_async(
+                    uploader->backend,
+                    tensor,
+                    buffer.host_ptr,
+                    size_t(slot) * entry->bytes_per_expert,
+                    entry->bytes_per_expert);
+            ggml_backend_event_record(buffer.event, uploader->backend);
+            buffer.pending = true;
+            uploader->next_buffer = (uploader->next_buffer + 1) % uploader->buffers.size();
+            metrics.upload_us += ggml_time_us() - t_upload_start_us;
+            metrics.install_us += ggml_time_us() - t_upload_start_us;
             return metrics;
         }
 
         staging.resize(entry->bytes_per_expert);
-        copy_from_source(staging.data());
-
-        const int64_t t_upload_start_us = ggml_time_us();
+        std::memcpy(staging.data(), src, entry->bytes_per_expert);
         ggml_backend_tensor_set(tensor, staging.data(), size_t(slot) * entry->bytes_per_expert, entry->bytes_per_expert);
         metrics.upload_us += ggml_time_us() - t_upload_start_us;
+        metrics.install_us += ggml_time_us() - t_upload_start_us;
+        return metrics;
+    }
+
+    install_metrics load_into_slot(
+            ggml_tensor * tensor,
+            const llama_flash_moe_sidecar_entry * entry,
+            int32_t expert,
+            int32_t slot) {
+        install_metrics metrics;
+        const int64_t t_install_start_us = ggml_time_us();
+        if (tensor == nullptr || entry == nullptr) {
+            return metrics;
+        }
+
+        staging.resize(entry->bytes_per_expert);
+        metrics = read_expert_bytes(entry, expert, staging.data());
+        const auto upload = upload_expert_bytes(tensor, entry, slot, staging.data());
+        metrics.upload_us += upload.upload_us;
+        metrics.install_us = ggml_time_us() - t_install_start_us;
         return metrics;
     }
 
@@ -1145,29 +1750,253 @@ private:
         totals.experts = pending_loads.size();
 
         const int64_t t_install_start_us = ggml_time_us();
+        std::vector<pending_slot_load> scheduled_loads;
+        scheduled_loads.reserve(pending_loads.size());
+
         for (const auto & [expert, slot] : pending_loads) {
             const int32_t evicted = state.slot_to_expert[slot];
             if (evicted >= 0 && evicted < expert_count) {
                 state.expert_to_slot[evicted] = -1;
+                totals.evict_loads++;
+            } else {
+                totals.cold_loads++;
+                state.resident_count++;
+                state.peak_resident_count = std::max(state.peak_resident_count, state.resident_count);
             }
-
-            for (const auto metrics : {
-                        load_into_slot(state.gate_up_tensor, state.gate_up_entry, expert, slot),
-                        load_into_slot(state.gate_tensor,    state.gate_entry,    expert, slot),
-                        load_into_slot(state.up_tensor,      state.up_entry,      expert, slot),
-                        load_into_slot(state.down_tensor,    state.down_entry,    expert, slot),
-                    }) {
-                totals.bytes += metrics.bytes;
-                totals.pread_ops += metrics.pread_ops;
-                totals.resident_copy_ops += metrics.resident_copy_ops;
-                totals.source_us += metrics.source_us;
-                totals.upload_us += metrics.upload_us;
-            }
-
-            state.slot_to_expert[slot] = expert;
-            state.expert_to_slot[expert] = slot;
+            scheduled_loads.push_back({ expert, slot });
         }
 
+        auto accumulate_install = [&](const install_metrics & metrics, int64_t & dst_us, uint64_t & dst_bytes) {
+            totals.bytes += metrics.bytes;
+            totals.pread_ops += metrics.pread_ops;
+            totals.resident_copy_ops += metrics.resident_copy_ops;
+            totals.source_us += metrics.source_us;
+            totals.upload_us += metrics.upload_us;
+            dst_us += metrics.install_us;
+            dst_bytes += metrics.bytes;
+        };
+
+        if (parallel_slot_reads && !resident_bank_source) {
+            if (batched_install_reads_enabled()) {
+                std::vector<install_chunk> chunks;
+                std::vector<pread_task> tasks;
+                chunks.reserve(scheduled_loads.size() * 4);
+                tasks.reserve(scheduled_loads.size() * 4 * std::max<int32_t>(1, cache_io_split));
+
+                auto queue_chunk = [&](const pending_slot_load & load, ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry, routed_family family) {
+                    if (tensor == nullptr || entry == nullptr) {
+                        return;
+                    }
+
+                    auto & chunk = chunks.emplace_back();
+                    chunk.tensor = tensor;
+                    chunk.entry = entry;
+                    chunk.family = family;
+                    chunk.expert = load.expert;
+                    chunk.slot = load.slot;
+                    chunk.bytes.resize(entry->bytes_per_expert);
+                    chunk.task_begin = tasks.size();
+
+                    const int fd = fd_for(entry->repacked_path);
+                    const off_t expert_offset = static_cast<off_t>(entry->repacked_offset + size_t(load.expert) * entry->bytes_per_expert);
+                    const int32_t split = active_cache_io_split(entry->bytes_per_expert, cache_io_split);
+                    chunk.task_count = split;
+
+                    if (split <= 1) {
+                        tasks.push_back({
+                                fd,
+                                chunk.bytes.data(),
+                                expert_offset,
+                                entry->bytes_per_expert,
+                                0,
+                                0,
+                        });
+                        return;
+                    }
+
+                    const size_t total_pages = entry->bytes_per_expert / flash_moe_page_bytes;
+                    size_t page_cursor = 0;
+                    for (int32_t chunk_idx = 0; chunk_idx < split; ++chunk_idx) {
+                        size_t pages_this_chunk = total_pages / (size_t) split;
+                        if ((size_t) chunk_idx < (total_pages % (size_t) split)) {
+                            pages_this_chunk++;
+                        }
+                        const size_t chunk_offset = page_cursor * flash_moe_page_bytes;
+                        const size_t chunk_size = pages_this_chunk * flash_moe_page_bytes;
+                        page_cursor += pages_this_chunk;
+
+                        tasks.push_back({
+                                fd,
+                                chunk.bytes.data() + chunk_offset,
+                                expert_offset + (off_t) chunk_offset,
+                                chunk_size,
+                                0,
+                                0,
+                        });
+                    }
+                };
+
+                for (const auto & load : scheduled_loads) {
+                    queue_chunk(load, state.gate_up_tensor, state.gate_up_entry, routed_family::gate_up);
+                    queue_chunk(load, state.gate_tensor,    state.gate_entry,    routed_family::gate);
+                    queue_chunk(load, state.up_tensor,      state.up_entry,      routed_family::up);
+                    queue_chunk(load, state.down_tensor,    state.down_entry,    routed_family::down);
+                }
+
+                execute_pread_tasks(tasks);
+
+                for (auto & chunk : chunks) {
+                    install_metrics metrics;
+                    metrics.bytes = chunk.entry->bytes_per_expert;
+
+                    ssize_t total_read = 0;
+                    for (int32_t task_idx = 0; task_idx < chunk.task_count; ++task_idx) {
+                        const auto & task = tasks[chunk.task_begin + size_t(task_idx)];
+                        metrics.pread_ops++;
+                        metrics.source_us += task.elapsed_us;
+                        if (task.result > 0) {
+                            total_read += task.result;
+                        }
+                    }
+
+                    if (total_read != (ssize_t) chunk.entry->bytes_per_expert) {
+                        throw std::runtime_error(format(
+                            "failed to split-read expert %d for tensor '%s' from '%s'",
+                            chunk.expert, chunk.entry->tensor_name.c_str(), chunk.entry->repacked_path.c_str()));
+                    }
+
+                    metrics.install_us += metrics.source_us;
+                    const auto upload = upload_expert_bytes(chunk.tensor, chunk.entry, chunk.slot, chunk.bytes.data());
+                    metrics.upload_us += upload.upload_us;
+                    metrics.install_us += upload.install_us;
+                    add_family_install(metrics, chunk.family, metrics.install_us, metrics.bytes);
+
+                    switch (chunk.family) {
+                        case routed_family::gate_up:
+                            accumulate_install(metrics, totals.gate_up_install_us, totals.gate_up_bytes);
+                            break;
+                        case routed_family::gate:
+                            accumulate_install(metrics, totals.gate_install_us, totals.gate_bytes);
+                            break;
+                        case routed_family::up:
+                            accumulate_install(metrics, totals.up_install_us, totals.up_bytes);
+                            break;
+                        case routed_family::down:
+                            accumulate_install(metrics, totals.down_install_us, totals.down_bytes);
+                            break;
+                    }
+                }
+            } else {
+                std::vector<install_chunk> chunks;
+                std::vector<std::future<install_metrics>> futures;
+                chunks.reserve(scheduled_loads.size() * 4);
+                futures.reserve(scheduled_loads.size() * 4);
+
+                auto queue_chunk = [&](const pending_slot_load & load, ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry, routed_family family) {
+                    if (tensor == nullptr || entry == nullptr) {
+                        return;
+                    }
+
+                    auto & chunk = chunks.emplace_back();
+                    chunk.tensor = tensor;
+                    chunk.entry = entry;
+                    chunk.family = family;
+                    chunk.expert = load.expert;
+                    chunk.slot = load.slot;
+                    chunk.bytes.resize(entry->bytes_per_expert);
+
+                    futures.emplace_back(std::async(std::launch::async, [this, &chunk]() {
+                        return read_expert_bytes(chunk.entry, chunk.expert, chunk.bytes.data());
+                    }));
+                };
+
+                for (const auto & load : scheduled_loads) {
+                    queue_chunk(load, state.gate_up_tensor, state.gate_up_entry, routed_family::gate_up);
+                    queue_chunk(load, state.gate_tensor,    state.gate_entry,    routed_family::gate);
+                    queue_chunk(load, state.up_tensor,      state.up_entry,      routed_family::up);
+                    queue_chunk(load, state.down_tensor,    state.down_entry,    routed_family::down);
+                }
+
+                std::vector<bool> chunk_done(chunks.size(), false);
+                size_t remaining = chunks.size();
+
+                auto consume_chunk = [&](size_t idx) {
+                    auto metrics = futures[idx].get();
+                    const auto upload = upload_expert_bytes(chunks[idx].tensor, chunks[idx].entry, chunks[idx].slot, chunks[idx].bytes.data());
+                    metrics.upload_us += upload.upload_us;
+                    metrics.install_us += upload.install_us;
+                    add_family_install(metrics, chunks[idx].family, metrics.install_us, metrics.bytes);
+
+                    switch (chunks[idx].family) {
+                        case routed_family::gate_up:
+                            accumulate_install(metrics, totals.gate_up_install_us, totals.gate_up_bytes);
+                            break;
+                        case routed_family::gate:
+                            accumulate_install(metrics, totals.gate_install_us, totals.gate_bytes);
+                            break;
+                        case routed_family::up:
+                            accumulate_install(metrics, totals.up_install_us, totals.up_bytes);
+                            break;
+                        case routed_family::down:
+                            accumulate_install(metrics, totals.down_install_us, totals.down_bytes);
+                            break;
+                    }
+                    chunk_done[idx] = true;
+                    --remaining;
+                };
+
+                while (remaining > 0) {
+                    bool progressed = false;
+                    for (size_t idx = 0; idx < chunks.size(); ++idx) {
+                        if (chunk_done[idx]) {
+                            continue;
+                        }
+                        if (futures[idx].wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                            continue;
+                        }
+                        consume_chunk(idx);
+                        progressed = true;
+                    }
+
+                    if (progressed) {
+                        continue;
+                    }
+
+                    for (size_t idx = 0; idx < chunks.size(); ++idx) {
+                        if (!chunk_done[idx]) {
+                            consume_chunk(idx);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            for (const auto & load : scheduled_loads) {
+                {
+                    const auto metrics = load_into_slot(state.gate_up_tensor, state.gate_up_entry, load.expert, load.slot);
+                    accumulate_install(metrics, totals.gate_up_install_us, totals.gate_up_bytes);
+                }
+                {
+                    const auto metrics = load_into_slot(state.gate_tensor, state.gate_entry, load.expert, load.slot);
+                    accumulate_install(metrics, totals.gate_install_us, totals.gate_bytes);
+                }
+                {
+                    const auto metrics = load_into_slot(state.up_tensor, state.up_entry, load.expert, load.slot);
+                    accumulate_install(metrics, totals.up_install_us, totals.up_bytes);
+                }
+                {
+                    const auto metrics = load_into_slot(state.down_tensor, state.down_entry, load.expert, load.slot);
+                    accumulate_install(metrics, totals.down_install_us, totals.down_bytes);
+                }
+            }
+        }
+
+        for (const auto & load : scheduled_loads) {
+            state.slot_to_expert[load.slot] = load.expert;
+            state.expert_to_slot[load.expert] = load.slot;
+        }
+
+        totals.upload_us += flush_async_uploads();
         totals.install_us = ggml_time_us() - t_install_start_us;
         return totals;
     }
@@ -1232,7 +2061,10 @@ llama_context::llama_context(
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
-    cparams.n_expert_used    = model.moe_n_expert_used();
+    cparams.n_expert_used    = params.moe_force_expert >= 0 ? 1 : model.moe_n_expert_used();
+    cparams.moe_force_expert = params.moe_force_expert;
+    cparams.moe_shared_only  = params.moe_shared_only;
+    cparams.moe_router_only  = params.moe_router_only;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -1251,6 +2083,36 @@ llama_context::llama_context(
         flash_moe_cb_eval_downstream_user_data = cparams.cb_eval_user_data;
         cparams.cb_eval = llama_context_flash_moe_eval_cb;
         cparams.cb_eval_user_data = this;
+    }
+
+    if (cparams.moe_shared_only) {
+        if (hparams.n_expert_shared == 0 && hparams.n_ff_shexp == 0) {
+            LLAMA_LOG_WARN("%s: --moe-shared-only is enabled, but model arch %d does not advertise shared experts; routed MoE will be bypassed anyway, which may not be meaningful\n",
+                    __func__, (int) model.arch);
+        } else {
+            LLAMA_LOG_INFO("%s: --moe-shared-only is enabled; routed experts will be bypassed at graph build time while shared experts remain active\n",
+                    __func__);
+        }
+    }
+
+    if (cparams.moe_router_only) {
+        LLAMA_LOG_INFO("%s: --moe-router-only is enabled; routed gating/top-k stays active but routed expert matmuls are bypassed and return zero contribution\n",
+                __func__);
+    }
+
+    if (cparams.moe_force_expert >= 0) {
+        if ((uint32_t) cparams.moe_force_expert >= hparams.n_expert) {
+            throw std::invalid_argument(format(
+                "--moe-force-expert=%d is out of range for this model (valid routed expert ids: 0..%u)",
+                cparams.moe_force_expert, hparams.n_expert > 0 ? hparams.n_expert - 1 : 0));
+        }
+        LLAMA_LOG_INFO("%s: --moe-force-expert=%d is enabled; routed selection is clamped to expert %d with K=1 for every token\n",
+                __func__, cparams.moe_force_expert, cparams.moe_force_expert);
+    }
+
+    if (model.flash_moe_temporal_prefetch_enabled()) {
+        LLAMA_LOG_WARN("%s: --moe-prefetch-temporal currently refreshes the current token's routed experts after decode to bias slot residency; it is not a future expert predictor in this build\n",
+                __func__);
     }
 
     // Initialize backend samplers here so they are part of the sampling graph
@@ -2408,6 +3270,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        flash_moe_log_routed_backends(gf, sched.get());
     }
 
     // set the input data for the input tensors
@@ -2717,6 +3581,47 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
         }
     }
     return false; // all sequences use backend sampling
+}
+
+static bool flash_moe_backend_trace_enabled() {
+    static const bool enabled = []() {
+        const char * val = getenv("LLAMA_FLASH_MOE_BACKEND_TRACE");
+        return val != nullptr && val[0] != '\0' && strcmp(val, "0") != 0;
+    }();
+    return enabled;
+}
+
+static void flash_moe_log_routed_backends(struct ggml_cgraph * gf, ggml_backend_sched_t sched) {
+    if (!flash_moe_backend_trace_enabled() || gf == nullptr || sched == nullptr) {
+        return;
+    }
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+
+        ggml_backend_t node_backend = ggml_backend_sched_get_tensor_backend(sched, node);
+        const char * node_backend_name = node_backend ? ggml_backend_name(node_backend) : "NULL";
+
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        const ggml_tensor * src2 = node->src[2];
+
+        ggml_backend_t src0_backend = src0 ? ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(src0)) : nullptr;
+        ggml_backend_t src1_backend = src1 ? ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(src1)) : nullptr;
+        ggml_backend_t src2_backend = src2 ? ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(src2)) : nullptr;
+
+        LLAMA_LOG_INFO("%s: node=%s backend=%s src0=%s src1=%s src2=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                __func__,
+                node->name,
+                node_backend_name,
+                src0_backend ? ggml_backend_name(src0_backend) : "NULL",
+                src1_backend ? ggml_backend_name(src1_backend) : "NULL",
+                src2_backend ? ggml_backend_name(src2_backend) : "NULL",
+                node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+    }
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
@@ -3329,6 +4234,8 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
     }
+
+    flash_moe_log_routed_backends(gf, sched.get());
 
     return gf;
 }
@@ -4119,6 +5026,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.moe_force_expert            =*/ -1,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -4131,8 +5039,10 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.sampler                     =*/ nullptr,
-        /*.n_sampler                   =*/ 0,
+        /*.moe_shared_only             =*/ false,
+        /*.moe_router_only             =*/ false,
+        /*.samplers                    =*/ nullptr,
+        /*.n_samplers                  =*/ 0,
     };
 
     return result;

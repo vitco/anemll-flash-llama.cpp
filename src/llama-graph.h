@@ -639,6 +639,9 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
+            cparams.moe_force_expert == other.cparams.moe_force_expert &&
+            cparams.moe_shared_only == other.cparams.moe_shared_only &&
+            cparams.moe_router_only == other.cparams.moe_router_only &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

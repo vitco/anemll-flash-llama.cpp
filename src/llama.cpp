@@ -51,6 +51,24 @@ struct llama_device_memory_data {
     llama_memory_breakdown_data mb;
 };
 
+static bool llama_project_host_buffers_to_unified_device(const std::vector<ggml_backend_dev_t> & devs) {
+    if (devs.size() != 1) {
+        return false;
+    }
+
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(devs[0], &props);
+
+    if (props.type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return true;
+    }
+
+    // Metal on Apple Silicon reports a GPU device here even though the backend is
+    // drawing from unified memory. In that case host-backed routed banks and device
+    // buffers still compete for the same physical pool, so they must both count for --fit.
+    return props.caps.buffer_from_host_ptr && !props.caps.host_buffer;
+}
+
 static std::vector<llama_device_memory_data> llama_get_device_memory_data(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
         std::vector<ggml_backend_dev_t> & devs, uint32_t & hp_ngl, uint32_t & hp_n_ctx_train, uint32_t & hp_n_expert,
@@ -91,11 +109,17 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data(
     }
 
     std::vector<llama_device_memory_data> ret(model->devices.size());
+    const bool project_host_to_unified_device = llama_project_host_buffers_to_unified_device(model->devices);
 
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown = ctx->memory_breakdown();
 
     for (const auto & [buft, mb] : memory_breakdown) {
         if (ggml_backend_buft_is_host(buft)) {
+            if (project_host_to_unified_device && !ret.empty()) {
+                ret[0].mb.model   += mb.model;
+                ret[0].mb.context += mb.context;
+                ret[0].mb.compute += mb.compute;
+            }
             continue;
         }
 
@@ -111,6 +135,9 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data(
                 break;
             }
         }
+    }
+    if (project_host_to_unified_device && !ret.empty()) {
+        LLAMA_LOG_INFO("%s: projected host-backed model/context/compute buffers onto unified-memory device for --fit\n", __func__);
     }
     for (size_t i = 0; i < ret.size(); i++) {
         size_t free;
@@ -827,8 +854,17 @@ int64_t llama_time_us(void) {
 }
 
 static bool llama_flash_moe_experimental_gpu_bank_enabled() {
+#ifdef LLAMA_FLASH_MOE_GPU_BANK
     const char * disable_value = std::getenv("LLAMA_FLASH_MOE_DISABLE_GPU_BANK");
     return disable_value == nullptr || disable_value[0] == '\0' || std::strcmp(disable_value, "0") == 0;
+#else
+    return false;
+#endif
+}
+
+static bool llama_flash_moe_allow_unsafe_deepseek2_gpu_bank() {
+    const char * value = std::getenv("LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
@@ -897,16 +933,21 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
 
         if (use_flash_moe_sidecar_runtime && params.n_gpu_layers != 0) {
             const bool flash_moe_experimental_gpu_bank = llama_flash_moe_experimental_gpu_bank_enabled();
+            const bool allow_unsafe_deepseek2_gpu_bank = llama_flash_moe_allow_unsafe_deepseek2_gpu_bank();
             if (flash_moe_experimental_gpu_bank) {
-                LLAMA_LOG_WARN("%s: Flash-MoE GPU-bank placement is enabled for mode '%s' with n_gpu_layers=%d in this fork; routed slot-bank tensors will follow repeating-layer placement while routed expert bytes continue to come from the sidecar path\n",
+                LLAMA_LOG_WARN("%s: Flash-MoE GPU-bank placement is enabled for mode '%s' with n_gpu_layers=%d in this build; routed slot-bank tensors will follow repeating-layer placement while routed expert bytes continue to come from the sidecar path\n",
                         __func__, moe_mode.c_str(), params.n_gpu_layers);
             } else {
-                LLAMA_LOG_WARN("%s: Flash-MoE mode '%s' with n_gpu_layers=%d is running with LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1; routed slot-bank tensors remain host-backed and GPU offload only affects dense/shared tensors in this fallback mode\n",
+                LLAMA_LOG_WARN("%s: Flash-MoE mode '%s' with n_gpu_layers=%d is using the host-backed routed bank path in this build; GPU offload affects dense/shared tensors only while routed experts stay on the sidecar slot-bank path, so keep --fit on to clamp dense/shared offload against the routed bank budget\n",
                         __func__, moe_mode.c_str(), params.n_gpu_layers);
             }
-            if (model.arch == LLM_ARCH_DEEPSEEK2) {
-                throw std::runtime_error(
-                    "Flash-MoE GPU offload is currently disabled for DeepSeek2/Kimi sidecar modes in this fork while the GPU-native routed bank path is being validated there; use -ngl 0");
+            if (model.arch == LLM_ARCH_DEEPSEEK2 && flash_moe_experimental_gpu_bank) {
+                if (!allow_unsafe_deepseek2_gpu_bank) {
+                    throw std::runtime_error(
+                        "Flash-MoE routed GPU-bank placement is currently disabled for DeepSeek2/Kimi sidecar modes in this build while that path is being validated; set LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1 to keep routed banks host-backed while still allowing dense/shared GPU offload, rebuild without LLAMA_FLASH_MOE_GPU_BANK, or set LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK=1 to override at your own risk");
+                }
+                LLAMA_LOG_WARN("%s: UNSAFE override enabled via LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK=1; DeepSeek2/Kimi sidecar mode will attempt GPU-bank placement and may hang or exhaust unified memory\n",
+                        __func__);
             }
         }
 

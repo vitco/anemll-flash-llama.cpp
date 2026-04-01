@@ -116,6 +116,12 @@ struct llama_model_loader {
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map_virtual;
 
+    bool   flash_moe_slot_bank_virtualization_active = false;
+    size_t flash_moe_virtualized_tensors             = 0;
+    size_t flash_moe_virtualized_bytes               = 0;
+    size_t flash_moe_filtered_load_tensors           = 0;
+    size_t flash_moe_filtered_load_bytes             = 0;
+
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
     std::string first_tensor_moved_name;

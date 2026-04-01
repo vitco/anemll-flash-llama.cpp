@@ -13,9 +13,10 @@ Flash-MoE inference for large GGUF Mixture-of-Experts models on Apple Silicon, u
 ## Current Model Support
 
 - `Qwen3.5` GGUF MoE is the current anchor path for bring-up and regression work.
-- In this fork, Qwen `slot-bank` defaults to GPU-offloaded dense/shared execution with GPU-visible routed slot banks when `-ngl > 0`; use `-ngl 999` instead of manually counting non-MoE layers.
+- In the default build of this fork, `slot-bank` keeps routed expert banks off GPU at compile time. Use `-ngl 999` with the default `--fit on` path to request maximum dense/shared offload without counting non-MoE layers by hand; the fitter clamps dense/shared placement against the routed slot-bank budget.
 - `Kimi-K2` and `Kimi-K2.5` GGUF support is experimental today: sidecar extraction, slot-bank runtime, trace capture, and bank modeling work, but quality and performance are still being tuned.
-- Kimi sidecar modes remain capped at `-ngl 0` for safety until the GPU-native routed bank path is validated there too.
+- Experimental routed GPU-bank placement is a separate build-time feature. Rebuild with `-DLLAMA_FLASH_MOE_GPU_BANK=ON` only if you explicitly want to test it.
+- Even in a GPU-bank build, DeepSeek2/Kimi routed GPU-bank experiments remain unsafe and still require `LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK=1`.
 
 ## Purpose
 
@@ -63,6 +64,7 @@ And native code only matters if the execution boundary really moves.
 - `--moe-slot-bank` for streamed resident slot capacity per routed MoE layer
 - `--moe-topk` for an experimental reduction-only routed expert override
 - `--moe-prefetch-temporal` for runtime one-step temporal prefetch on top of `slot-bank`
+- `--moe-shared-only` for a shared-expert-only diagnostic path that bypasses routed experts at graph build time
 - `--moe-trace-harness` for long non-interactive raw trace runs from `llama-cli`
 - `--moe-trace` and `--moe-verify-sidecar` for replay and validation workflows
 - sidecar extract / inspect / verify tooling under [`tools/flashmoe-sidecar/`](./tools/flashmoe-sidecar/)
@@ -134,12 +136,15 @@ build/bin/llama-cli \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen35 \
   --moe-slot-bank 128 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
+  -fit on \
   -ub 4 -b 64 -ngl 999 -c 256 --seed 0 --temp 0 \
   -p "What is Apple Neural Engine" -n 120
 ```
 
-In `slot-bank` mode you do not need to know how many layers are routed MoE versus dense/shared.
-Routed expert tensors are virtualized out of the normal GGUF weight loader, so `-ngl 999` applies the regular offload policy to dense/shared tensors while routed expert bytes continue to come from the sidecar path.
+In the default build, `slot-bank` does not put routed expert banks on GPU.
+Routed expert tensors are virtualized out of the normal GGUF weight loader, so `-ngl 999` applies the regular offload policy to dense/shared tensors while routed expert bytes continue to come from the sidecar path. Keep `--fit` enabled here: on unified-memory systems it clamps dense/shared offload against the routed slot-bank reserve.
+
+For MLX-style diagnostics and prefill simulations, add `--moe-shared-only` to keep the shared expert path active while forcing the routed MoE contribution to zero. This is useful when you want the same dense/shared placement and sampler settings without routed miss traffic.
 
 ### Kimi-K2.5 (5-shard GGUF, 217 GB sidecar)
 
@@ -167,19 +172,20 @@ python3 tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
   --sidecar ~/Models/flash/Kimi-K2.5-sidecar
 # → verified 180 Flash-MoE sidecar entries against 5 GGUF file(s)
 
-# 5. Run slot-bank inference (current Kimi safe fallback: sidecar streaming with `-ngl 0`)
+# 5. Run slot-bank inference
 build/bin/llama-cli \
   -m ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/Kimi-K2.5-sidecar \
   --moe-slot-bank 64 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
-  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
+  -fit on \
+  -ub 4 -b 64 -ngl 999 -c 256 --seed 0 --temp 0 \
   -p "What is Apple Neural Engine" -n 100
 ```
 
-Kimi keeps `-ngl 0` in this fork on purpose.
-This is the current safety fallback, not the new Qwen-style default.
-Its sidecar path is working, but the GPU-native routed bank path is not yet validated there, so sidecar-mode GPU offload stays blocked to avoid unsafe memory pressure and hard freezes.
+In the default build, this still keeps the routed bank off GPU.
+`-ngl 999` offloads dense/shared tensors only; routed expert bytes continue to stream through the sidecar slot-bank path. Keep `--fit` on for this path so the fork can clamp dense/shared offload against the routed host-bank budget; do not use `-fit off` here unless you are deliberately doing an unsafe manual test.
+Only a special rebuild with `-DLLAMA_FLASH_MOE_GPU_BANK=ON` changes that behavior.
 
 ### Sidecar Directory Layout
 

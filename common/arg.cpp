@@ -2233,13 +2233,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SIDECAR"));
     add_opt(common_arg(
-        {"--moe-mode"}, "{stock,resident,resident-bank,slot-bank,oracle-all-hit,oracle-prefetch}",
+        {"--moe-mode"}, "{stock,resident,resident-bank,resident-slot-bank,slot-bank,oracle-all-hit,oracle-prefetch}",
         "Flash-MoE runtime mode",
         [](common_params & params, const std::string & value) {
             static const std::set<std::string> valid = {
                 "stock",
                 "resident",
                 "resident-bank",
+                "resident-slot-bank",
                 "slot-bank",
                 "oracle-all-hit",
                 "oracle-prefetch",
@@ -2271,13 +2272,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_TOPK"));
     add_opt(common_arg(
+        {"--moe-cache-io-split"}, "N",
+        "split each routed expert pread into N page-aligned chunks during slot-bank installs (1 = disabled, 4 is a good 397B starting point)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_io_split = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_IO_SPLIT"));
+    add_opt(common_arg(
+        {"--moe-force-expert"}, "N",
+        "force routed expert selection to a single expert id for every token (implies K=1 inside the routed path, -1 disables)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_force_expert = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_FORCE_EXPERT"));
+    add_opt(common_arg(
         {"--moe-prefetch-temporal"},
         {"--no-moe-prefetch-temporal"},
-        string_format("enable real runtime one-step temporal prefetch on top of Flash-MoE slot-bank mode (default: %s)", params.moe_prefetch_temporal ? "enabled" : "disabled"),
+        string_format("enable the current Flash-MoE temporal-reuse heuristic, which refreshes the current token's routed experts after decode to bias slot residency (default: %s)", params.moe_prefetch_temporal ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.moe_prefetch_temporal = value;
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH_TEMPORAL"));
+    add_opt(common_arg(
+        {"--moe-shared-only"},
+        {"--no-moe-shared-only"},
+        string_format("bypass routed experts at graph build time and keep shared experts only (default: %s)", params.moe_shared_only ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_shared_only = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SHARED_ONLY"));
+    add_opt(common_arg(
+        {"--moe-router-only"},
+        {"--no-moe-router-only"},
+        string_format("run routed gating/top-k but bypass routed expert matmuls and return zero routed contribution (default: %s)", params.moe_router_only ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_router_only = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_ROUTER_ONLY"));
     add_opt(common_arg(
         {"--moe-trace-harness"},
         "llama-cli only: bypass the chat loop and run the provided --prompt as a raw non-interactive completion for long Flash-MoE trace collection",
@@ -2292,6 +2329,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_trace = value;
         }
     ).set_env("LLAMA_ARG_MOE_TRACE"));
+    add_opt(common_arg(
+        {"--oracle-dump"}, "DIR",
+        "llama-cli only: record a hidden-state oracle directory for offline MLX comparison (currently requires --moe-trace-harness)",
+        [](common_params & params, const std::string & value) {
+            params.oracle_dump = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_ORACLE_DUMP"));
+    add_opt(common_arg(
+        {"--oracle-topk"}, "N",
+        string_format("llama-cli only: keep the top-N final logits per token in --oracle-dump (default: %d)", params.oracle_topk),
+        [](common_params & params, int32_t value) {
+            params.oracle_topk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_ORACLE_TOPK"));
     add_opt(common_arg(
         {"--moe-quant-map"}, "FILE",
         "Flash-MoE dynamic-quant policy file reserved for future bank selection work",

@@ -6,13 +6,18 @@
 
 #include "server-context.h"
 #include "server-task.h"
+#include "ggml-cpu.h"
 
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <signal.h>
 
@@ -51,6 +56,319 @@ static void signal_handler(int) {
     g_is_interrupted.store(true);
 }
 #endif
+
+namespace {
+
+std::string oracle_sanitize_name(const std::string & name) {
+    std::string out;
+    out.reserve(name.size());
+    for (const char ch : name) {
+        if ((ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '_' || ch == '-' || ch == '.') {
+            out.push_back(ch);
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out;
+}
+
+std::pair<std::string, int> oracle_parse_name_layer(const std::string & raw_name) {
+    const size_t dash = raw_name.rfind('-');
+    if (dash != std::string::npos && dash + 1 < raw_name.size()) {
+        bool all_digits = true;
+        for (size_t i = dash + 1; i < raw_name.size(); ++i) {
+            if (raw_name[i] < '0' || raw_name[i] > '9') {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) {
+            return { raw_name.substr(0, dash), std::atoi(raw_name.c_str() + dash + 1) };
+        }
+    }
+    return { raw_name, -1 };
+}
+
+bool oracle_wants_base_name(const std::string_view base_name) {
+    return base_name == "embd" ||
+           base_name == "attn_norm" ||
+           base_name == "attn_out" ||
+           base_name == "kqv_out" ||
+           base_name == "ffn_inp" ||
+           base_name == "ffn_norm" ||
+           base_name == "ffn_shexp" ||
+           base_name == "ffn_out" ||
+           base_name == "l_out" ||
+           base_name == "result_norm" ||
+           base_name == "result_output";
+}
+
+struct oracle_tensor_record {
+    int eval_index = 0;
+    std::string phase;
+    std::string name;
+    int layer = -1;
+    std::array<int64_t, 4> ne = {0, 0, 0, 0};
+    std::string dtype;
+    std::string file;
+};
+
+struct oracle_logits_record {
+    int eval_index = 0;
+    std::string phase;
+    std::vector<int32_t> token_ids;
+    std::vector<float> logits;
+};
+
+class cli_oracle_dump {
+public:
+    cli_oracle_dump(const std::filesystem::path & out_dir, int topk)
+        : out_dir_(out_dir), tensor_dir_(out_dir / "tensors"), logits_topk_(std::max(1, topk)) {
+        std::filesystem::create_directories(tensor_dir_);
+    }
+
+    bool enabled() const {
+        return !out_dir_.empty();
+    }
+
+    void set_prompt(const std::string & prompt, std::vector<llama_token> prompt_ids) {
+        prompt_ = prompt;
+        prompt_ids_ = std::move(prompt_ids);
+    }
+
+    void set_model_path(const std::string & model_path) {
+        model_path_ = model_path;
+    }
+
+    bool wants_tensor(const ggml_tensor * t) const {
+        if (t == nullptr || t->name[0] == '\0') {
+            return false;
+        }
+        const auto [base_name, _layer] = oracle_parse_name_layer(std::string(t->name));
+        return oracle_wants_base_name(base_name);
+    }
+
+    bool handle_tensor(const ggml_tensor * t) {
+        if (t == nullptr || !wants_tensor(t)) {
+            return true;
+        }
+
+        const std::string raw_name(t->name);
+        const auto [base_name, layer_index] = oracle_parse_name_layer(raw_name);
+        if (base_name == "result_output") {
+            capture_topk_logits(t);
+            ++eval_index_;
+            return true;
+        }
+
+        const auto values = flatten_tensor_f32(t);
+        const std::string file_name = tensor_file_name(raw_name);
+        const std::filesystem::path file_path = tensor_dir_ / file_name;
+        std::ofstream fout(file_path, std::ios::binary);
+        if (!fout) {
+            throw std::runtime_error("failed to open oracle tensor output file: " + file_path.string());
+        }
+        fout.write(reinterpret_cast<const char *>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
+        fout.close();
+
+        oracle_tensor_record record;
+        record.eval_index = eval_index_;
+        record.phase = phase_for_eval(eval_index_);
+        record.name = base_name;
+        record.layer = layer_index;
+        for (int i = 0; i < 4; ++i) {
+            record.ne[i] = t->ne[i];
+        }
+        record.dtype = "f32";
+        record.file = std::string("tensors/") + file_name;
+        tensor_records_.push_back(std::move(record));
+        return true;
+    }
+
+    void finish() const {
+        if (!enabled()) {
+            return;
+        }
+
+        json manifest;
+        manifest["format"] = "llama-cli-oracle-v1";
+        manifest["prompt"] = prompt_;
+        manifest["prompt_ids"] = prompt_ids_;
+        manifest["prompt_token_count"] = prompt_ids_.size();
+        manifest["model_path"] = model_path_;
+        manifest["logits_topk"] = logits_topk_;
+        manifest["tensor_names"] = json::array({
+            "embd",
+            "attn_norm",
+            "attn_out",
+            "kqv_out",
+            "ffn_inp",
+            "ffn_norm",
+            "ffn_shexp",
+            "ffn_out",
+            "l_out",
+            "result_norm",
+        });
+        manifest["records"] = json::array();
+        for (const auto & record : tensor_records_) {
+            manifest["records"].push_back({
+                {"eval_index", record.eval_index},
+                {"phase", record.phase},
+                {"name", record.name},
+                {"layer", record.layer},
+                {"ne", {record.ne[0], record.ne[1], record.ne[2], record.ne[3]}},
+                {"dtype", record.dtype},
+                {"file", record.file},
+            });
+        }
+        manifest["logits"] = json::array();
+        for (const auto & record : logits_records_) {
+            manifest["logits"].push_back({
+                {"eval_index", record.eval_index},
+                {"phase", record.phase},
+                {"token_ids", record.token_ids},
+                {"logits", record.logits},
+            });
+        }
+
+        std::ofstream fout(out_dir_ / "manifest.json", std::ios::binary);
+        if (!fout) {
+            throw std::runtime_error("failed to open oracle manifest output file");
+        }
+        fout << manifest.dump(2) << "\n";
+    }
+
+private:
+    std::filesystem::path out_dir_;
+    std::filesystem::path tensor_dir_;
+    int logits_topk_ = 32;
+    int eval_index_ = 0;
+    std::string prompt_;
+    std::string model_path_;
+    std::vector<llama_token> prompt_ids_;
+    std::vector<oracle_tensor_record> tensor_records_;
+    std::vector<oracle_logits_record> logits_records_;
+
+    std::string phase_for_eval(int eval_index) const {
+        return eval_index < static_cast<int>(prompt_ids_.size()) ? "prefill" : "decode";
+    }
+
+    std::string tensor_file_name(const std::string & name) const {
+        char prefix[32];
+        std::snprintf(prefix, sizeof(prefix), "%06d_", eval_index_);
+        return std::string(prefix) + oracle_sanitize_name(name) + ".bin";
+    }
+
+    static float read_tensor_value_f32(
+        const uint8_t * data,
+        ggml_type type,
+        const size_t * nb,
+        size_t i0,
+        size_t i1,
+        size_t i2,
+        size_t i3) {
+        const size_t offset = i3 * nb[3] + i2 * nb[2] + i1 * nb[1] + i0 * nb[0];
+        switch (type) {
+            case GGML_TYPE_F32:
+                return *(const float *) &data[offset];
+            case GGML_TYPE_F16:
+                return ggml_fp16_to_fp32(*(const ggml_fp16_t *) &data[offset]);
+            case GGML_TYPE_BF16:
+                return ggml_bf16_to_fp32(*(const ggml_bf16_t *) &data[offset]);
+            case GGML_TYPE_I32:
+                return (float) *(const int32_t *) &data[offset];
+            case GGML_TYPE_I16:
+                return (float) *(const int16_t *) &data[offset];
+            case GGML_TYPE_I8:
+                return (float) *(const int8_t *) &data[offset];
+            default:
+                throw std::runtime_error("unsupported oracle tensor dtype: " + std::string(ggml_type_name(type)));
+        }
+    }
+
+    static std::vector<float> flatten_tensor_f32(const ggml_tensor * t) {
+        const int64_t n0 = std::max<int64_t>(1, t->ne[0]);
+        const int64_t n1 = std::max<int64_t>(1, t->ne[1]);
+        const int64_t n2 = std::max<int64_t>(1, t->ne[2]);
+        const int64_t n3 = std::max<int64_t>(1, t->ne[3]);
+        const bool is_host = t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer);
+        std::vector<uint8_t> host_copy;
+        if (!is_host) {
+            host_copy.resize(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, host_copy.data(), 0, host_copy.size());
+        }
+        const uint8_t * data = is_host ? (const uint8_t *) t->data : host_copy.data();
+        if (data == nullptr) {
+            const char * tensor_name = t->name[0] != '\0' ? t->name : "<unnamed>";
+            throw std::runtime_error("oracle tensor has no readable data for " + std::string(tensor_name));
+        }
+        std::vector<float> values;
+        values.reserve(static_cast<size_t>(n0 * n1 * n2 * n3));
+        for (int64_t i3 = 0; i3 < n3; ++i3) {
+            for (int64_t i2 = 0; i2 < n2; ++i2) {
+                for (int64_t i1 = 0; i1 < n1; ++i1) {
+                    for (int64_t i0 = 0; i0 < n0; ++i0) {
+                        values.push_back(read_tensor_value_f32(
+                            data,
+                            t->type,
+                            t->nb,
+                            static_cast<size_t>(i0),
+                            static_cast<size_t>(i1),
+                            static_cast<size_t>(i2),
+                            static_cast<size_t>(i3)));
+                    }
+                }
+            }
+        }
+        return values;
+    }
+
+    void capture_topk_logits(const ggml_tensor * t) {
+        const auto values = flatten_tensor_f32(t);
+        std::vector<int32_t> indices(values.size());
+        std::iota(indices.begin(), indices.end(), 0);
+        const size_t keep = std::min<size_t>(static_cast<size_t>(logits_topk_), indices.size());
+        if (keep == 0) {
+            return;
+        }
+        std::partial_sort(
+            indices.begin(),
+            indices.begin() + static_cast<ptrdiff_t>(keep),
+            indices.end(),
+            [&](const int32_t lhs, const int32_t rhs) {
+                return values[static_cast<size_t>(lhs)] > values[static_cast<size_t>(rhs)];
+            }
+        );
+
+        oracle_logits_record record;
+        record.eval_index = eval_index_;
+        record.phase = phase_for_eval(eval_index_);
+        record.token_ids.reserve(keep);
+        record.logits.reserve(keep);
+        for (size_t i = 0; i < keep; ++i) {
+            const int32_t token_id = indices[i];
+            record.token_ids.push_back(token_id);
+            record.logits.push_back(values[static_cast<size_t>(token_id)]);
+        }
+        logits_records_.push_back(std::move(record));
+    }
+};
+
+static bool cli_oracle_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * oracle = static_cast<cli_oracle_dump *>(user_data);
+    if (oracle == nullptr || !oracle->enabled()) {
+        return true;
+    }
+    if (ask) {
+        return oracle->wants_tensor(t);
+    }
+    return oracle->handle_tensor(t);
+}
+
+} // namespace
 
 struct cli_context {
     server_context ctx_server;
@@ -371,6 +689,21 @@ int main(int argc, char ** argv) {
         console::error("please use llama-completion instead\n");
     }
 
+    std::optional<cli_oracle_dump> oracle_dump;
+    if (!params.oracle_dump.empty()) {
+        if (!params.moe_trace_harness) {
+            console::error("--oracle-dump currently requires --moe-trace-harness so the recorded prompt ids match a single raw completion request\n");
+            return 1;
+        }
+        if (params.prompt.empty()) {
+            console::error("--oracle-dump requires --prompt so the capture can be tied to a single known request\n");
+            return 1;
+        }
+        oracle_dump.emplace(std::filesystem::path(params.oracle_dump), params.oracle_topk);
+        params.cb_eval = cli_oracle_cb_eval;
+        params.cb_eval_user_data = &*oracle_dump;
+    }
+
     common_init();
 
     // struct that contains llama context and inference
@@ -416,6 +749,12 @@ int main(int argc, char ** argv) {
     });
 
     auto inf = ctx_cli.ctx_server.get_meta();
+    if (oracle_dump.has_value()) {
+        const llama_context * lctx = ctx_cli.ctx_server.get_llama_context();
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(lctx));
+        oracle_dump->set_model_path(inf.model_path);
+        oracle_dump->set_prompt(params.prompt, common_tokenize(vocab, params.prompt, false, true));
+    }
     std::string modalities = "text";
     if (inf.has_inp_image) {
         modalities += ", vision";
@@ -486,6 +825,10 @@ int main(int argc, char ** argv) {
         console::log("\nExiting...\n");
         ctx_cli.ctx_server.terminate();
         inference_thread.join();
+        if (oracle_dump.has_value()) {
+            oracle_dump->finish();
+            console::log("oracle dump: %s\n", params.oracle_dump.c_str());
+        }
         common_log_set_verbosity_thold(LOG_LEVEL_INFO);
         llama_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
         return 0;
@@ -632,6 +975,10 @@ int main(int argc, char ** argv) {
     console::log("\nExiting...\n");
     ctx_cli.ctx_server.terminate();
     inference_thread.join();
+    if (oracle_dump.has_value()) {
+        oracle_dump->finish();
+        console::log("oracle dump: %s\n", params.oracle_dump.c_str());
+    }
 
     // bump the log level to display timings
     common_log_set_verbosity_thold(LOG_LEVEL_INFO);

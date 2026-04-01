@@ -345,6 +345,7 @@ struct cmd_params {
     std::vector<int>                 moe_slot_bank;
     std::vector<int>                 moe_topk;
     std::vector<bool>                moe_prefetch_temporal;
+    std::vector<bool>                moe_shared_only;
     std::vector<bool>                moe_verify_sidecar;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
@@ -394,6 +395,7 @@ static const cmd_params cmd_params_defaults = {
     /* moe_slot_bank        */ { 0 },
     /* moe_topk             */ { 0 },
     /* moe_prefetch_temporal*/ { false },
+    /* moe_shared_only      */ { false },
     /* moe_verify_sidecar   */ { false },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
@@ -460,11 +462,12 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -dio, --direct-io <0|1>                     (default: %s)\n", join(cmd_params_defaults.use_direct_io, ",").c_str());
     printf("  --moe-sidecar <path>                        (default: disabled)\n");
-    printf("  --moe-mode <stock|resident|resident-bank|slot-bank|oracle-all-hit|oracle-prefetch>   (default: %s)\n", join(cmd_params_defaults.moe_mode, ",").c_str());
+    printf("  --moe-mode <stock|resident|resident-bank|resident-slot-bank|slot-bank|oracle-all-hit|oracle-prefetch>   (default: %s)\n", join(cmd_params_defaults.moe_mode, ",").c_str());
     printf("  --moe-trace <path>                             (default: disabled)\n");
     printf("  --moe-slot-bank <n>                         (default: %s)\n", join(cmd_params_defaults.moe_slot_bank, ",").c_str());
     printf("  --moe-topk <n>                              (default: %s)\n", join(cmd_params_defaults.moe_topk, ",").c_str());
     printf("  --moe-prefetch-temporal <0|1>              (default: %s)\n", join(cmd_params_defaults.moe_prefetch_temporal, ",").c_str());
+    printf("  --moe-shared-only <0|1>                    (default: %s)\n", join(cmd_params_defaults.moe_shared_only, ",").c_str());
     printf("  --moe-verify-sidecar                        validate sidecar metadata parity during load\n");
     printf("  -embd, --embeddings <0|1>                   (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>            (default: 0)\n");
@@ -831,7 +834,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
-                static const std::unordered_set<std::string> valid = { "stock", "resident", "resident-bank", "slot-bank", "oracle-all-hit", "oracle-prefetch" };
+                static const std::unordered_set<std::string> valid = { "stock", "resident", "resident-bank", "resident-slot-bank", "slot-bank", "oracle-all-hit", "oracle-prefetch" };
                 for (const auto & mode : p) {
                     if (!valid.count(mode)) {
                         invalid_param = true;
@@ -888,6 +891,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.moe_prefetch_temporal.insert(params.moe_prefetch_temporal.end(), p.begin(), p.end());
+            } else if (arg == "--moe-shared-only") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.moe_shared_only.insert(params.moe_shared_only.end(), p.begin(), p.end());
             } else if (arg == "--moe-verify-sidecar") {
                 params.moe_verify_sidecar.push_back(true);
             } else if (arg == "-embd" || arg == "--embeddings") {
@@ -1194,6 +1204,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.moe_prefetch_temporal.empty()) {
         params.moe_prefetch_temporal = cmd_params_defaults.moe_prefetch_temporal;
     }
+    if (params.moe_shared_only.empty()) {
+        params.moe_shared_only = cmd_params_defaults.moe_shared_only;
+    }
     if (params.moe_verify_sidecar.empty()) {
         params.moe_verify_sidecar = cmd_params_defaults.moe_verify_sidecar;
     }
@@ -1243,6 +1256,7 @@ struct cmd_params_instance {
     int                moe_slot_bank;
     int                moe_topk;
     bool               moe_prefetch_temporal;
+    bool               moe_shared_only;
     bool               moe_verify_sidecar;
     bool               embeddings;
     bool               no_op_offload;
@@ -1316,6 +1330,7 @@ struct cmd_params_instance {
                moe_sidecar == other.moe_sidecar && moe_mode == other.moe_mode && moe_trace == other.moe_trace &&
                moe_slot_bank == other.moe_slot_bank && moe_topk == other.moe_topk &&
                moe_prefetch_temporal == other.moe_prefetch_temporal &&
+               moe_shared_only == other.moe_shared_only &&
                moe_verify_sidecar == other.moe_verify_sidecar &&
                devices == other.devices &&
                no_host == other.no_host &&
@@ -1335,6 +1350,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.moe_shared_only = moe_shared_only;
 
         return cparams;
     }
@@ -1361,6 +1377,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & msb : params.moe_slot_bank)
     for (const auto & mtk : params.moe_topk)
     for (const auto & mpt : params.moe_prefetch_temporal)
+    for (const auto & mso : params.moe_shared_only)
     for (const auto & mvs : params.moe_verify_sidecar)
     for (const auto & noh : params.no_host)
     for (const auto & embd : params.embeddings)
@@ -1410,6 +1427,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_slot_bank = */ msb,
                 /* .moe_topk     = */ mtk,
                 /* .moe_prefetch_temporal = */ mpt,
+                /* .moe_shared_only = */ mso,
                 /* .moe_verify_sidecar = */ mvs,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
@@ -1452,6 +1470,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_slot_bank = */ msb,
                 /* .moe_topk     = */ mtk,
                 /* .moe_prefetch_temporal = */ mpt,
+                /* .moe_shared_only = */ mso,
                 /* .moe_verify_sidecar = */ mvs,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
@@ -1494,6 +1513,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_slot_bank = */ msb,
                 /* .moe_topk     = */ mtk,
                 /* .moe_prefetch_temporal = */ mpt,
+                /* .moe_shared_only = */ mso,
                 /* .moe_verify_sidecar = */ mvs,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
@@ -1541,6 +1561,7 @@ struct test {
     int                      moe_slot_bank;
     int                      moe_topk;
     bool                     moe_prefetch_temporal;
+    bool                     moe_shared_only;
     bool                     moe_verify_sidecar;
     bool                     embeddings;
     bool                     no_op_offload;
@@ -1586,6 +1607,7 @@ struct test {
         moe_slot_bank  = inst.moe_slot_bank;
         moe_topk       = inst.moe_topk;
         moe_prefetch_temporal = inst.moe_prefetch_temporal;
+        moe_shared_only = inst.moe_shared_only;
         moe_verify_sidecar = inst.moe_verify_sidecar;
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
@@ -1647,7 +1669,7 @@ struct test {
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "moe_sidecar",
-            "moe_mode",       "moe_trace",      "moe_slot_bank", "moe_topk", "moe_prefetch_temporal", "moe_verify_sidecar",             "embeddings",
+            "moe_mode",       "moe_trace",      "moe_slot_bank", "moe_topk", "moe_prefetch_temporal", "moe_shared_only", "moe_verify_sidecar",             "embeddings",
             "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1665,7 +1687,7 @@ struct test {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "moe_prefetch_temporal" || field == "moe_verify_sidecar" ||
+            field == "use_mmap" || field == "use_direct_io" || field == "moe_prefetch_temporal" || field == "moe_shared_only" || field == "moe_verify_sidecar" ||
             field == "embeddings" || field == "no_host") {
             return BOOL;
         }
@@ -1746,6 +1768,7 @@ struct test {
                                             std::to_string(moe_slot_bank),
                                             std::to_string(moe_topk),
                                             std::to_string(moe_prefetch_temporal),
+                                            std::to_string(moe_shared_only),
                                             std::to_string(moe_verify_sidecar),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
@@ -1999,6 +2022,9 @@ struct markdown_printer : public printer {
         if (field == "moe_prefetch_temporal") {
             return "mpref";
         }
+        if (field == "moe_shared_only") {
+            return "mshared";
+        }
         if (field == "moe_verify_sidecar") {
             return "mver";
         }
@@ -2106,6 +2132,9 @@ struct markdown_printer : public printer {
         }
         if (params.moe_prefetch_temporal.size() > 1 || params.moe_prefetch_temporal != cmd_params_defaults.moe_prefetch_temporal) {
             fields.emplace_back("moe_prefetch_temporal");
+        }
+        if (params.moe_shared_only.size() > 1 || params.moe_shared_only != cmd_params_defaults.moe_shared_only) {
+            fields.emplace_back("moe_shared_only");
         }
         if (params.moe_verify_sidecar.size() > 1 || params.moe_verify_sidecar != cmd_params_defaults.moe_verify_sidecar) {
             fields.emplace_back("moe_verify_sidecar");

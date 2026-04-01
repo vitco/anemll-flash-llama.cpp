@@ -26,6 +26,7 @@ struct llama_cparams {
     float yarn_attn_factor;
     float yarn_beta_fast;
     float yarn_beta_slow;
+    int32_t moe_force_expert;
 
     bool embeddings;
     bool causal_attn;
@@ -39,6 +40,8 @@ struct llama_cparams {
     bool warmup;
     bool op_offload;
     bool kv_unified;
+    bool moe_shared_only;
+    bool moe_router_only;
     bool pipeline_parallel;
 
     enum llama_pooling_type pooling_type;

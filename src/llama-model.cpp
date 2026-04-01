@@ -1,5 +1,7 @@
 #include "llama-model.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
@@ -32,6 +34,8 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static bool llama_flash_moe_mode_is(const llama_model_params & params, const char * mode) {
     return params.moe_mode != nullptr && mode != nullptr && strcmp(params.moe_mode, mode) == 0;
@@ -43,9 +47,69 @@ static int64_t llama_flash_moe_slot_bank_size_for(const llama_model_params & par
 }
 
 static bool llama_flash_moe_experimental_gpu_bank_enabled() {
+#ifdef LLAMA_FLASH_MOE_GPU_BANK
     const char * disable_value = std::getenv("LLAMA_FLASH_MOE_DISABLE_GPU_BANK");
     return disable_value == nullptr || disable_value[0] == '\0' || std::strcmp(disable_value, "0") == 0;
+#else
+    return false;
+#endif
 }
+
+static bool llama_flash_moe_deep_log_enabled() {
+    const char * value = std::getenv("LLAMA_FLASH_MOE_DEEP_LOG");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static bool llama_flash_moe_is_routed_tensor_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    return std::strstr(name, ".ffn_gate_up_exps.") != nullptr ||
+           std::strstr(name, ".ffn_gate_exps.")    != nullptr ||
+           std::strstr(name, ".ffn_up_exps.")      != nullptr ||
+           std::strstr(name, ".ffn_down_exps.")    != nullptr;
+}
+
+static bool llama_flash_moe_ctx_is_routed_virtual_bank(ggml_context * ctx) {
+    bool saw_tensor = false;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        saw_tensor = true;
+        if (!llama_flash_moe_is_routed_tensor_name(ggml_get_name(t))) {
+            return false;
+        }
+    }
+
+    return saw_tensor;
+}
+
+static size_t llama_flash_moe_ctx_tensor_count(ggml_context * ctx) {
+    size_t count = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        ++count;
+    }
+    return count;
+}
+
+static void llama_flash_moe_log_ctx_tensors(const char * tag, ggml_context * ctx) {
+    if (!llama_flash_moe_deep_log_enabled()) {
+        return;
+    }
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        LLAMA_LOG_INFO("%s:   tensor %-48s type=%-8s nbytes=%10.2f MiB view=%d\n",
+                tag,
+                ggml_get_name(t),
+                ggml_type_name(t->type),
+                ggml_nbytes(t) / 1024.0 / 1024.0,
+                t->view_src != nullptr);
+    }
+}
+
+struct llama_flash_moe_sparse_mapping {
+    void * addr = nullptr;
+    size_t size = 0;
+};
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -308,7 +372,15 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        ctxs_bufs.clear();
+        mlock_bufs.clear();
+        for (const auto & mapping : flash_moe_sparse_mappings) {
+            if (mapping.addr != nullptr && mapping.addr != MAP_FAILED && mapping.size > 0) {
+                munmap(mapping.addr, mapping.size);
+            }
+        }
+    }
 
     uint64_t n_elements = 0;
 
@@ -345,10 +417,81 @@ struct llama_model::impl {
     bool flash_moe_oracle_prefetch_enabled = false;
     bool flash_moe_temporal_prefetch_enabled = false;
     int32_t flash_moe_slot_bank_size = 0;
+    int32_t flash_moe_cache_io_split = 1;
     int32_t moe_n_expert_used = 0;
     std::string flash_moe_trace_file;
     std::unordered_map<std::string, llama_flash_moe_sidecar_entry> flash_moe_sidecar_entries;
+    std::vector<llama_flash_moe_sparse_mapping> flash_moe_sparse_mappings;
 };
+
+static ggml_backend_buffer_t llama_flash_moe_alloc_sparse_ctx_buffer(
+        ggml_context * ctx,
+        ggml_backend_dev_t dev,
+        ggml_backend_buffer_type_t buft,
+        std::vector<llama_flash_moe_sparse_mapping> & sparse_mappings,
+        const char * log_tag) {
+    const size_t requested_size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+    if (requested_size == 0) {
+        return nullptr;
+    }
+
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    const size_t page_size = page_size_raw > 0 ? size_t(page_size_raw) : size_t(4096);
+    const size_t mapped_size = GGML_PAD(requested_size, page_size);
+
+    void * sparse_base = mmap(nullptr, mapped_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (sparse_base == MAP_FAILED) {
+        throw std::runtime_error(format("failed to reserve sparse Flash-MoE slot-bank mapping of %.2f GiB",
+                mapped_size / 1024.0 / 1024.0 / 1024.0));
+    }
+
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    const bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+    if (props.caps.buffer_from_host_ptr && is_default_buft) {
+        buffer = ggml_backend_dev_buffer_from_host_ptr(dev, sparse_base, mapped_size, ggml_get_max_tensor_size(ctx));
+    }
+    if (buffer == nullptr) {
+        buffer = ggml_backend_cpu_buffer_from_ptr(sparse_base, mapped_size);
+    }
+    if (buffer == nullptr) {
+        munmap(sparse_base, mapped_size);
+        throw std::runtime_error(format("failed to create sparse Flash-MoE buffer wrapper for %.2f GiB mapping",
+                mapped_size / 1024.0 / 1024.0 / 1024.0));
+    }
+
+    struct ggml_tallocr tallocr = ggml_tallocr_new(buffer);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        enum ggml_status status = GGML_STATUS_SUCCESS;
+        if (t->data == nullptr) {
+            if (t->view_src == nullptr) {
+                status = ggml_tallocr_alloc(&tallocr, t);
+            } else if (t->buffer == nullptr) {
+                status = ggml_backend_view_init(t);
+            }
+        } else if (t->view_src != nullptr && t->buffer == nullptr) {
+            status = ggml_backend_view_init(t);
+        }
+
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            munmap(sparse_base, mapped_size);
+            throw std::runtime_error(format("failed to initialize sparse Flash-MoE tensor '%s'",
+                    ggml_get_name(t)));
+        }
+    }
+
+    sparse_mappings.push_back({ sparse_base, mapped_size });
+    LLAMA_LOG_INFO("%s: Flash-MoE sparse virtual-bank mapping reserved %.2f GiB for %zu routed tensors via %s\n",
+            log_tag,
+            mapped_size / 1024.0 / 1024.0 / 1024.0,
+            llama_flash_moe_ctx_tensor_count(ctx),
+            ggml_backend_buft_name(buft));
+    llama_flash_moe_log_ctx_tensors(log_tag, ctx);
+
+    return buffer;
+}
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
@@ -356,6 +499,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->flash_moe_oracle_all_hit_enabled = llama_flash_moe_mode_is(params, "oracle-all-hit");
     pimpl->flash_moe_oracle_prefetch_enabled = llama_flash_moe_mode_is(params, "oracle-prefetch");
     pimpl->flash_moe_temporal_prefetch_enabled = params.moe_prefetch_temporal;
+    pimpl->flash_moe_cache_io_split = std::max<int32_t>(1, params.moe_cache_io_split);
     pimpl->flash_moe_slot_bank_enabled = llama_flash_moe_mode_is(params, "slot-bank") ||
             pimpl->flash_moe_resident_source_enabled ||
             pimpl->flash_moe_oracle_all_hit_enabled ||
@@ -2640,6 +2784,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const int64_t flash_moe_slot_count = flash_moe_slot_bank ?
         llama_flash_moe_slot_bank_size_for(params, std::max<int64_t>(1, pimpl->moe_n_expert_used)) : 0;
 
+    // Dense/shared tensors can still benefit from mmap-backed GPU wrapping in slot-bank
+    // mode, but only when the wrapped GGUF file span is close to the actual payload.
+    // The per-context sanity check in create_ctx_buffers() disables this path when a
+    // large split model would otherwise wrap pathological file spans.
     const bool use_mmap_buffer = true;
 
     pimpl->flash_moe_sidecar_entries.clear();
@@ -2647,12 +2795,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     if (flash_moe_slot_bank && n_gpu_layers != 0) {
         if (flash_moe_experimental_gpu_bank) {
-            LLAMA_LOG_WARN("%s: Flash-MoE GPU-bank placement is enabled in this fork; routed slot-bank tensors will use the repeating-layer buffer list instead of forced CPU buffers (set LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1 to force the legacy host-backed path)\n",
+            LLAMA_LOG_WARN("%s: Flash-MoE GPU-bank placement is enabled in this build; routed slot-bank tensors will use the repeating-layer buffer list instead of forced CPU buffers (set LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1 to force the host-backed path)\n",
                     __func__);
         } else {
-            LLAMA_LOG_WARN("%s: slot-bank routed expert tensors are forced onto CPU/host-backed virtual buffers because LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1 is set; --n-gpu-layers offloads only dense/shared tensors in this fallback mode\n",
+            LLAMA_LOG_WARN("%s: slot-bank routed expert tensors are using CPU/host-backed virtual buffers in this build; --n-gpu-layers offloads dense/shared tensors only, while routed expert bytes continue to come from the sidecar path\n",
                     __func__);
         }
+        LLAMA_LOG_INFO("%s: Flash-MoE slot-bank uses span-sanity checks for mmap-backed GPU weight wrapping; dense/shared tensors fall back to regular allocation + upload only when a GGUF file span inflates far beyond the real payload\n",
+                __func__);
     }
 
     if (flash_moe_slot_bank) {
@@ -7709,11 +7859,34 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
         };
 
+        auto require_virtualized_routed_tensor = [&](const ggml_tensor * tensor) {
+            if (tensor == nullptr) {
+                return;
+            }
+
+            const std::string name = ggml_get_name(tensor);
+            if (ml.get_weight(name.c_str()) != nullptr) {
+                throw std::runtime_error(format(
+                        "Flash-MoE slot-bank routed tensor '%s' is still present in the GGUF weights_map and would be loadable through the normal loader path",
+                        name.c_str()));
+            }
+        };
+
         for (const auto & layer : layers) {
             require_sidecar_entry(layer.ffn_gate_up_exps);
             require_sidecar_entry(layer.ffn_gate_exps);
             require_sidecar_entry(layer.ffn_up_exps);
             require_sidecar_entry(layer.ffn_down_exps);
+            require_virtualized_routed_tensor(layer.ffn_gate_up_exps);
+            require_virtualized_routed_tensor(layer.ffn_gate_exps);
+            require_virtualized_routed_tensor(layer.ffn_up_exps);
+            require_virtualized_routed_tensor(layer.ffn_down_exps);
+        }
+        if (ml.flash_moe_slot_bank_virtualization_active) {
+            LLAMA_LOG_INFO("%s: Flash-MoE slot-bank virtualized %zu routed tensors (%.2f GiB); these tensors are excluded from GGUF tensor data loading and must come from the sidecar runtime path\n",
+                    __func__,
+                    ml.flash_moe_virtualized_tensors,
+                    ml.flash_moe_virtualized_bytes / 1024.0 / 1024.0 / 1024.0);
         }
         LLAMA_LOG_INFO("%s: slot-bank routed tensor coverage validated\n", __func__);
     }
@@ -7732,7 +7905,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = (ml.ctx_map.size() + ml.ctx_map_virtual.size()) * std::max<size_t>(1, ml.files.size());
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-    auto create_ctx_buffers = [&](auto & ctx_map_src, bool allow_mmap_host_ptr) {
+    auto create_ctx_buffers = [&](auto & ctx_map_src, bool allow_mmap_host_ptr, const char * ctx_kind) {
+        constexpr double flash_moe_mmap_max_ratio = 1.50;
+        constexpr size_t flash_moe_mmap_max_extra_bytes = 512ull * 1024ull * 1024ull;
+
         for (auto & [buft, ctx_ptr] : ctx_map_src) {
             ggml_context * ctx = ctx_ptr.get();
 
@@ -7754,9 +7930,73 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             ggml_backend_dev_get_props(dev, &props);
             const bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
             const bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+            const bool flash_moe_sparse_virtual_bank =
+                    flash_moe_slot_bank &&
+                    !allow_mmap_host_ptr &&
+                    llama_flash_moe_ctx_is_routed_virtual_bank(ctx);
+            const size_t projected_size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+
+            LLAMA_LOG_INFO("%s: preparing %s context with %zu tensors via %s (projected %.2f GiB)%s\n",
+                    __func__,
+                    ctx_kind,
+                    llama_flash_moe_ctx_tensor_count(ctx),
+                    ggml_backend_buft_name(buft),
+                    projected_size / 1024.0 / 1024.0 / 1024.0,
+                    flash_moe_sparse_virtual_bank ? " using sparse Flash-MoE virtual-bank backing" : "");
+            llama_flash_moe_log_ctx_tensors(__func__, ctx);
 
             std::vector<ggml_backend_buffer_ptr> bufs;
-            if (allow_mmap_host_ptr && ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+            bool allow_ctx_mmap_wrap = allow_mmap_host_ptr && ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft;
+            if (allow_ctx_mmap_wrap && flash_moe_slot_bank) {
+                for (uint32_t idx = 0; idx < ml.files.size(); ++idx) {
+                    void * addr = nullptr;
+                    size_t first = 0;
+                    size_t last  = 0;
+                    ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                    GGML_UNUSED(addr);
+                    if (first >= last) {
+                        continue;
+                    }
+
+                    size_t payload_bytes = 0;
+                    size_t payload_tensors = 0;
+                    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+                        const auto * weight = ml.get_weight(ggml_get_name(tensor));
+                        if (!weight || weight->idx != idx) {
+                            continue;
+                        }
+                        payload_bytes += ggml_nbytes(tensor);
+                        payload_tensors++;
+                    }
+
+                    const size_t span_bytes = last - first;
+                    const size_t extra_bytes = span_bytes > payload_bytes ? span_bytes - payload_bytes : 0;
+                    const double ratio = payload_bytes > 0 ? (double) span_bytes / (double) payload_bytes : 0.0;
+                    const bool sane = payload_bytes > 0 &&
+                            ratio <= flash_moe_mmap_max_ratio &&
+                            extra_bytes <= flash_moe_mmap_max_extra_bytes;
+
+                    if (llama_flash_moe_deep_log_enabled() || !sane) {
+                        LLAMA_LOG_INFO("%s: %s ctx mmap span check file %u -> payload %.2f GiB across %zu tensors, span %.2f GiB, extra %.2f GiB, ratio %.2fx%s\n",
+                                __func__,
+                                ctx_kind,
+                                idx,
+                                payload_bytes / 1024.0 / 1024.0 / 1024.0,
+                                payload_tensors,
+                                span_bytes / 1024.0 / 1024.0 / 1024.0,
+                                extra_bytes / 1024.0 / 1024.0 / 1024.0,
+                                ratio,
+                                sane ? "" : " -> fallback");
+                    }
+
+                    if (!sane) {
+                        allow_ctx_mmap_wrap = false;
+                        break;
+                    }
+                }
+            }
+
+            if (allow_ctx_mmap_wrap) {
                 GGML_ASSERT(!ml.no_alloc);
                 for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                     void * addr = nullptr;
@@ -7782,6 +8022,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                         t->buffer = buf;
                     }
+                } else if (flash_moe_sparse_virtual_bank) {
+                    buf = llama_flash_moe_alloc_sparse_ctx_buffer(
+                            ctx, dev, buft, pimpl->flash_moe_sparse_mappings, __func__);
                 } else {
                     buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
                 }
@@ -7811,9 +8054,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     };
 
     LLAMA_LOG_INFO("%s: creating backend buffers for materialized tensors\n", __func__);
-    create_ctx_buffers(ml.ctx_map, true);
+    create_ctx_buffers(ml.ctx_map, true, "materialized");
     LLAMA_LOG_INFO("%s: creating backend buffers for virtual tensors\n", __func__);
-    create_ctx_buffers(ml.ctx_map_virtual, false);
+    create_ctx_buffers(ml.ctx_map_virtual, false, "virtual");
     LLAMA_LOG_INFO("%s: backend buffers created for %zu contexts\n", __func__, pimpl->ctxs_bufs.size());
 
     if (llama_supports_gpu_offload()) {
@@ -8063,7 +8306,7 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: expert_weights_scale  = %.1f\n",   __func__, hparams.expert_weights_scale);
     }
 
-    if (arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4) {
+    if (!hparams.vocab_only && (arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4)) {
         LLAMA_LOG_INFO("%s: n_layer_dense_lead    = %d\n",     __func__, hparams.n_layer_dense_lead);
         LLAMA_LOG_INFO("%s: n_lora_q              = %d\n",     __func__, hparams.n_lora_q);
         LLAMA_LOG_INFO("%s: n_lora_kv             = %d\n",     __func__, hparams.n_lora_kv);
@@ -8226,6 +8469,10 @@ bool llama_model::flash_moe_temporal_prefetch_enabled() const {
 
 int32_t llama_model::flash_moe_slot_bank_size() const {
     return pimpl->flash_moe_slot_bank_size;
+}
+
+int32_t llama_model::flash_moe_cache_io_split() const {
+    return pimpl->flash_moe_cache_io_split;
 }
 
 int32_t llama_model::moe_n_expert_used() const {
@@ -8966,6 +9213,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_prefetch_temporal       =*/ false,
         /*.moe_slot_bank               =*/ 0,
         /*.moe_topk_override           =*/ 0,
+        /*.moe_cache_io_split          =*/ 1,
     };
 
     return result;

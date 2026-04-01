@@ -1048,8 +1048,19 @@ common_init_result::common_init_result(common_params & params) :
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    const bool flash_moe_sidecar_runtime =
+        !params.moe_sidecar.empty() && params.moe_mode != "stock";
+    const bool flash_moe_gpu_offload_requested = params.n_gpu_layers != 0;
+    const bool flash_moe_allow_unfit_offload =
+        getenv("LLAMA_FLASH_MOE_ALLOW_UNFIT_OFFLOAD") != nullptr;
+
+    if (flash_moe_sidecar_runtime && flash_moe_gpu_offload_requested && !params.fit_params && !flash_moe_allow_unfit_offload) {
+        LOG_ERR("%s: Flash-MoE sidecar runs with GPU offload must keep --fit on in this fork so dense/shared offload is clamped against the routed slot-bank on unified-memory systems; remove '-fit off', use '-ngl 0', or set LLAMA_FLASH_MOE_ALLOW_UNFIT_OFFLOAD=1 for an unsafe manual test\n", __func__);
+        return;
+    }
+
     if (params.fit_params) {
-        LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
+        LOG_INF("%s: fitting params to device memory; for Flash-MoE sidecar runs keep --fit on so dense/shared offload is clamped against the routed slot-bank budget\n", __func__);
         llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
@@ -1334,6 +1345,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_prefetch_temporal = params.moe_prefetch_temporal;
     mparams.moe_slot_bank      = params.moe_slot_bank;
     mparams.moe_topk_override  = params.moe_topk_override;
+    mparams.moe_cache_io_split = params.moe_cache_io_split;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1384,6 +1396,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.moe_force_expert  = params.moe_force_expert;
+    cparams.moe_shared_only   = params.moe_shared_only;
+    cparams.moe_router_only   = params.moe_router_only;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

@@ -335,6 +335,7 @@ extern "C" {
 
         int32_t moe_slot_bank; // slot-bank resident expert capacity per routed MoE layer
         int32_t moe_topk_override; // runtime reduction-only override for routed experts per token (0 = model metadata)
+        int32_t moe_cache_io_split; // split each routed expert pread into N page-aligned chunks (1 = disabled)
     };
 
     struct llama_sampler_seq_config {
@@ -366,6 +367,7 @@ extern "C" {
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
+        int32_t  moe_force_expert; // force routed selection to a single expert id (-1 = disabled)
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
@@ -390,6 +392,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool moe_shared_only; // bypass routed experts during graph build and keep shared experts only
+        bool moe_router_only; // keep routed gating/top-k active but bypass routed expert matmuls
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
