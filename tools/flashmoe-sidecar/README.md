@@ -37,6 +37,16 @@ PYTHON=python3 \
   --out-dir /Users/anemll/Models/flash/qwen35
 ```
 
+## Extract a Gemma4-26B-A4B sidecar
+
+```bash
+PYTHON=python3 \
+./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
+  --out-dir /Users/anemll/Models/gemma4/packed_experts \
+  --force
+```
+
 ## Verify the sidecar
 
 ```bash
@@ -44,6 +54,15 @@ PYTHON=python3 \
 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
   --model /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --sidecar /Users/anemll/Models/flash/qwen35
+```
+
+Gemma4 verification uses the same command shape:
+
+```bash
+PYTHON=python3 \
+./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
+  --model /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
+  --sidecar /Users/anemll/Models/gemma4/packed_experts
 ```
 
 ## Inspect a model or subset
@@ -163,6 +182,43 @@ Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-back
   -p "What is Apple Neural Engine" \
   -n 32 -st
 ```
+
+## Run Gemma4-26B-A4B with the sidecar
+
+Resident-bank smoke test:
+
+```bash
+./llama.cpp/build-flashmoe/bin/llama-cli \
+  --color off --simple-io \
+  -m /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
+  --moe-mode resident-bank \
+  --moe-sidecar /Users/anemll/Models/gemma4/packed_experts \
+  -cnv -st -fit on \
+  -ub 1 -b 1 -ngl 0 -c 4096 --seed 0 --temp 0 \
+  -p "Make a poem about Apple Neural Engine in 4 lines." \
+  -n 64
+```
+
+Streamed slot-bank smoke test:
+
+```bash
+./llama.cpp/build-flashmoe/bin/llama-cli \
+  --color off --simple-io \
+  -m /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar /Users/anemll/Models/gemma4/packed_experts \
+  --moe-slot-bank 16 \
+  -cnv -st -fit on \
+  -ub 1 -b 1 -ngl 0 -c 4096 --seed 0 --temp 0 \
+  -p "Make a poem about Apple Neural Engine in 4 lines." \
+  -n 64
+```
+
+Gemma4-specific notes:
+
+- `gemma-4-26B-A4B-it` is instruction tuned. For quality comparisons, prefer normal chat mode (`-cnv -st`) over `--moe-trace-harness`, which uses raw completion.
+- Gemma4 uses native `n_expert_used = 8`. Leave `--moe-topk` unset for fidelity unless you are deliberately testing reduced top-k routing.
+- On smaller-memory devices, Gemma4 is more sensitive to slot-bank size than Qwen3.5-35B because each selected expert payload is larger. A slot bank of `8` or `16` is a better starting point than desktop-style larger banks.
 
 In the default build of this fork, Qwen `slot-bank` is expected to use `-ngl 999`.
 You do not need to know how many layers are routed MoE versus dense/shared; routed expert tensors are virtualized out of the normal GGUF loader and continue to come from the sidecar path. Keep `--fit` on so the fork clamps dense/shared offload against the routed bank budget on unified-memory systems.

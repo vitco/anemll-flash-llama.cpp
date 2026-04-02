@@ -65,6 +65,12 @@ static bool llama_flash_moe_is_routed_tensor_name(const char * name) {
         return false;
     }
 
+    // Per-expert scale tensors (e.g. ffn_down_exps.scale) are small metadata
+    // that stay in the GGUF — they are not routed expert weight data.
+    if (std::strstr(name, ".scale") != nullptr) {
+        return false;
+    }
+
     return std::strstr(name, ".ffn_gate_up_exps.") != nullptr ||
            std::strstr(name, ".ffn_gate_exps.")    != nullptr ||
            std::strstr(name, ".ffn_up_exps.")      != nullptr ||
@@ -139,6 +145,15 @@ static void llama_flash_moe_log_ctx_tensors(const char * tag, ggml_context * ctx
                 ggml_nbytes(t) / 1024.0 / 1024.0,
                 t->view_src != nullptr);
     }
+}
+
+static bool llama_flash_moe_disable_sparse_virtual_bank_for_arch(llm_arch arch) {
+    // Gemma4 routed slot-bank tensors are coherent on GPU when they live in a
+    // regular Metal buffer (resident-bank), but become corrupted when backed by
+    // the sparse host-mapped virtual-bank wrapper. Keep its routed slot-bank
+    // tensors on normal device allocation until the sparse path is validated for
+    // IQ2_XXS / IQ4_NL Gemma4 experts.
+    return arch == LLM_ARCH_GEMMA4;
 }
 
 struct llama_flash_moe_sparse_mapping {
@@ -1503,6 +1518,31 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 switch (hparams.n_layer) {
                     case 30: type = LLM_TYPE_E2B; break;
                     case 35: type = LLM_TYPE_E4B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_GEMMA4:
+            {
+                hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+                ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+
+                uint32_t n_kv_shared_layers = 0;
+                ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
+
+                hparams.n_layer_kv_from_start = hparams.n_layer - (int32_t)n_kv_shared_layers;
+                hparams.f_attention_scale     = 1.0f; // Gemma4 uses self.scaling = 1.0 (no pre-attn scaling)
+
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  hparams.n_embd_per_layer);
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,    hparams.n_embd_head_k_swa);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,  hparams.n_embd_head_v_swa);
+
+                switch (hparams.n_layer) {
+                    case 35: type = LLM_TYPE_E2B; break;
+                    case 42: type = LLM_TYPE_E4B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -4584,6 +4624,100 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.laurel_l             = create_tensor(tn(LLM_TENSOR_LAUREL_L,            "weight", i), {n_embd, laurel_rank}, 0);
                         layer.laurel_r             = create_tensor(tn(LLM_TENSOR_LAUREL_R,            "weight", i), {laurel_rank, n_embd}, 0);
                         layer.laurel_post_norm     = create_tensor(tn(LLM_TENSOR_LAUREL_POST_NORM,    "weight", i), {n_embd}, 0);
+                    }
+                } break;
+            case LLM_ARCH_GEMMA4:
+                {
+                    const uint32_t n_embd_per_layer = hparams.n_embd_per_layer;
+                    const int64_t  n_ff_exp         = hparams.n_ff_exp;
+
+                    if (n_embd_head_k != n_embd_head_v) {
+                        throw std::runtime_error("Gemma 4 requires n_embd_head_k == n_embd_head_v");
+                    }
+                    if (hparams.n_embd_head_k_swa != hparams.n_embd_head_v_swa) {
+                        throw std::runtime_error("Gemma 4 requires n_embd_head_k_swa == n_embd_head_v_swa");
+                    }
+
+                    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    // if output is NULL, init from the input tok embed
+                    if (output == NULL) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    if (n_embd_per_layer > 0) {
+                        tok_embd_per_layer   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {n_embd_per_layer * n_layer, n_vocab}, 0);
+                        per_layer_model_proj = create_tensor(tn(LLM_TENSOR_PER_LAYER_MODEL_PROJ, "weight"), {n_embd, n_embd_per_layer * n_layer}, 0);
+                        per_layer_proj_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM,  "weight"), {n_embd_per_layer}, 0);
+                    }
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+
+                    int rope_freqs_flag = 0;
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+                        const int64_t n_head      = hparams.n_head(i);
+                        const int64_t n_embd_head = hparams.n_embd_head_k(i);
+                        const int64_t n_embd_k    = hparams.n_embd_k_gqa(i);
+                        const int64_t n_embd_v    = hparams.n_embd_v_gqa(i);
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        // note: use_alternative_attention (v_proj is optional, if it's not present, use k_proj)
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head * n_head}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v}, TENSOR_NOT_REQUIRED);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, 0);
+
+                        layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
+                        layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head}, 0);
+                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
+
+                        layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1u}, TENSOR_NOT_REQUIRED);
+
+                        if (!hparams.is_swa(i)) {
+                            // full_attention layers use rope_freqs for proportional rope
+                            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_embd_head/2}, rope_freqs_flag);
+                            rope_freqs_flag = TENSOR_DUPLICATED;
+                        }
+
+                        // handle use_double_wide_mlp
+                        int64_t n_ff_cur = hparams.n_ff(i);
+
+                        // for expert layers, we use normal FFN as shared expert (same as python code)
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd}, 0);
+                        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
+
+                        // MoE router
+                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+                        bool has_expert = layer.ffn_gate_inp != nullptr;
+
+                        // norm
+                        if (has_expert) {
+                            layer.ffn_gate_inp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "scale", i), {n_embd}, 0);
+
+                            layer.ffn_pre_norm_2  = create_tensor(tn(LLM_TENSOR_FFN_PRE_NORM_2,  "weight", i), {n_embd}, 0);
+                            layer.ffn_post_norm_1 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_1, "weight", i), {n_embd}, 0);
+                            layer.ffn_post_norm_2 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_2, "weight", i), {n_embd}, 0);
+
+                            // MoE FFN
+                            layer.ffn_gate_up_exps  = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, 0);
+                            layer.ffn_down_exps     = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+
+                            // per-expert scale will be loaded as down_exps_s at the end of the current switch case
+                        }
+
+                        // per-layer embeddings
+                        if (n_embd_per_layer > 0) {
+                            layer.per_layer_inp_gate   = create_tensor(tn(LLM_TENSOR_PER_LAYER_INP_GATE,  "weight", i), {n_embd, n_embd_per_layer}, 0);
+                            layer.per_layer_proj       = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ,      "weight", i), {n_embd_per_layer, n_embd}, 0);
+                            layer.per_layer_post_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_POST_NORM, "weight", i), {n_embd}, 0);
+                        }
                     }
                 } break;
             case LLM_ARCH_STARCODER2:
@@ -7974,21 +8108,37 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev, &props);
+            ggml_backend_buffer_type_t alloc_buft = buft;
+            if (flash_moe_slot_bank &&
+                llama_flash_moe_ctx_is_routed_virtual_bank(ctx) &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                std::strcmp(ggml_backend_buft_name(buft), "CPU_REPACK") == 0) {
+                alloc_buft = ggml_backend_cpu_buffer_type();
+                LLAMA_LOG_INFO("%s: routed slot-bank context cannot use CPU_REPACK (partial expert uploads); falling back to %s allocation\n",
+                        __func__, ggml_backend_buft_name(alloc_buft));
+            }
             const bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
-            const bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+            const bool is_default_buft = alloc_buft == ggml_backend_dev_buffer_type(dev);
+            const bool sparse_virtual_bank_disabled_for_arch =
+                    llama_flash_moe_disable_sparse_virtual_bank_for_arch(arch);
             const bool flash_moe_sparse_virtual_bank =
                     flash_moe_slot_bank &&
                     !allow_mmap_host_ptr &&
-                    llama_flash_moe_ctx_is_routed_virtual_bank(ctx);
-            const size_t projected_size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+                    llama_flash_moe_ctx_is_routed_virtual_bank(ctx) &&
+                    !sparse_virtual_bank_disabled_for_arch;
+            const size_t projected_size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, alloc_buft);
 
             LLAMA_LOG_INFO("%s: preparing %s context with %zu tensors via %s (projected %.2f GiB)%s\n",
                     __func__,
                     ctx_kind,
                     llama_flash_moe_ctx_tensor_count(ctx),
-                    ggml_backend_buft_name(buft),
+                    ggml_backend_buft_name(alloc_buft),
                     projected_size / 1024.0 / 1024.0 / 1024.0,
                     flash_moe_sparse_virtual_bank ? " using sparse Flash-MoE virtual-bank backing" : "");
+            if (sparse_virtual_bank_disabled_for_arch && llama_flash_moe_ctx_is_routed_virtual_bank(ctx)) {
+                LLAMA_LOG_INFO("%s: routed virtual-bank sparse backing disabled for %s; using regular %s allocation for this routed slot-bank context\n",
+                        __func__, llm_arch_name(arch), ggml_backend_buft_name(alloc_buft));
+            }
             llama_flash_moe_log_ctx_tensors(__func__, ctx);
 
             std::vector<ggml_backend_buffer_ptr> bufs;
@@ -8051,10 +8201,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     if (first >= last) {
                         continue;
                     }
-                    const size_t max_size = ggml_get_max_tensor_size(ctx);
+                        const size_t max_size = ggml_get_max_tensor_size(ctx);
                     ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                     if (buf == nullptr) {
-                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(alloc_buft)));
                     }
                     bufs.emplace_back(buf);
                     buf_map.emplace(idx, buf);
@@ -8064,18 +8214,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (bufs.empty()) {
                 ggml_backend_buffer_t buf;
                 if (ml.no_alloc) {
-                    buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+                    buf = ggml_backend_buft_alloc_buffer(alloc_buft, /*size =*/ 0);
                     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                         t->buffer = buf;
                     }
                 } else if (flash_moe_sparse_virtual_bank) {
                     buf = llama_flash_moe_alloc_sparse_ctx_buffer(
-                            ctx, dev, buft, pimpl->flash_moe_sparse_mappings, __func__);
+                            ctx, dev, alloc_buft, pimpl->flash_moe_sparse_mappings, __func__);
                 } else {
-                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, alloc_buft);
                 }
                 if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(alloc_buft)));
                 }
                 if (use_mlock && ggml_backend_buffer_is_host(buf)) {
                     pimpl->mlock_bufs.emplace_back(new llama_mlock);
@@ -8655,7 +8805,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
 
-                    if (arch == LLM_ARCH_GEMMA3N) {
+                    if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](int32_t il) {
                             if (il >= (int32_t) hparams.n_layer_kv_from_start) {
                                 return (int32_t) hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
@@ -8907,6 +9057,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_GEMMA3N:
             {
                 llm = std::make_unique<llm_build_gemma3n_iswa>(*this, params);
+            } break;
+        case LLM_ARCH_GEMMA4:
+            {
+                llm = std::make_unique<llm_build_gemma4_iswa>(*this, params);
             } break;
         case LLM_ARCH_GEMMA_EMBEDDING:
             {
@@ -9435,6 +9589,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA2:
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
+        case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_OPENELM:

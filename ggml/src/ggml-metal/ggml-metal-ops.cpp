@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <cstring>
 #include <limits>
 #include <cmath>
 
@@ -55,6 +56,85 @@ static bool ggml_metal_mul_mat_id_ids_are_decode_ready(const ggml_tensor * ids) 
     }
 
     return ids->op == GGML_OP_NONE || ids->op == GGML_OP_MAP_CUSTOM1;
+}
+
+static bool ggml_metal_mul_mat_id_materialize_ids_if_needed(
+        const ggml_tensor * op,
+        ggml_metal_buffer_id bid_dst,
+        ggml_metal_buffer_id & bid_ids,
+        uint64_t & nb21_out) {
+    const ggml_tensor * ids = op != nullptr ? op->src[2] : nullptr;
+    if (ids == nullptr || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    if (bid_ids.metal != nullptr) {
+        nb21_out = ids->nb[1];
+        return true;
+    }
+
+    if (!ggml_metal_mul_mat_id_ids_are_decode_ready(ids)) {
+        return false;
+    }
+
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    if (n_expert_used <= 0 || n_tokens <= 0) {
+        return false;
+    }
+
+    std::vector<int32_t> translated_ids(size_t(n_expert_used * n_tokens));
+    for (int64_t token_idx = 0; token_idx < n_tokens; ++token_idx) {
+        if (!ggml_metal_mul_mat_id_get_decode_expert_ids(
+                ids,
+                translated_ids.data() + size_t(token_idx * n_expert_used),
+                n_expert_used,
+                token_idx)) {
+            return false;
+        }
+    }
+
+    ggml_backend_buffer_t dst_buf = op->view_src ? op->view_src->buffer : op->buffer;
+    if (dst_buf == nullptr) {
+        return false;
+    }
+
+    ggml_metal_buffer_t metal_buf = (ggml_metal_buffer_t) dst_buf->context;
+    if (metal_buf == nullptr) {
+        return false;
+    }
+
+    const size_t ids_offset = ggml_nbytes(op) + ggml_metal_op_mul_mat_id_extra_tpe(op);
+    ggml_metal_buffer_set_tensor(
+            metal_buf,
+            const_cast<ggml_tensor *>(op),
+            translated_ids.data(),
+            ids_offset,
+            translated_ids.size() * sizeof(int32_t));
+
+    bid_ids = bid_dst;
+    bid_ids.offs += ids_offset;
+    nb21_out = uint64_t(n_expert_used) * sizeof(int32_t);
+    return true;
+}
+
+static bool ggml_metal_mul_mat_id_disable_decode_fast_path_for_op(const ggml_tensor * op) {
+    if (op == nullptr || op->src[0] == nullptr) {
+        return false;
+    }
+
+    const ggml_type type = op->src[0]->type;
+    if (type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_IQ4_NL) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(op->src[0]);
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    return strstr(name, ".ffn_gate_up_exps.") != nullptr ||
+           strstr(name, ".ffn_down_exps.") != nullptr;
 }
 
 static bool ggml_metal_mul_mat_id_experimental_split_glu_enabled(void) {
@@ -3146,7 +3226,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // dispatches against selected expert slices. This keeps the hot decode case off the generic
     // mul_mv_id path while still reading dynamic expert ids from the ids tensor.
     constexpr int64_t ne20_decode_mv_max = 32;
-    if (ggml_metal_mul_mat_id_ids_are_decode_ready(op->src[2]) &&
+    if (!ggml_metal_mul_mat_id_disable_decode_fast_path_for_op(op) &&
+        ggml_metal_mul_mat_id_ids_are_decode_ready(op->src[2]) &&
         ne21 == 1 && ne20 > 0 && ne20 <= ne20_decode_mv_max) {
         std::array<int32_t, ne20_decode_mv_max> expert_ids = {};
         if (ggml_metal_mul_mat_id_get_decode_expert_ids(op->src[2], expert_ids.data(), ne20, 0)) {
@@ -3332,10 +3413,14 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         const size_t smem = pipeline.smem;
 
+        ggml_metal_buffer_id bid_src2_mv = bid_src2;
+        uint64_t nb21_mv = nb21;
+        ggml_metal_mul_mat_id_materialize_ids_if_needed(op, bid_dst, bid_src2_mv, nb21_mv);
+
         ggml_metal_kargs_mul_mv_id args = {
             /*.nei0 =*/ ne20,
             /*.nei1 =*/ ne21,
-            /*.nbi1 =*/ nb21,
+            /*.nbi1 =*/ nb21_mv,
             /*.ne00 =*/ ne00,
             /*.ne01 =*/ ne01,
             /*.ne02 =*/ ne02,
@@ -3364,7 +3449,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, bid_src0, 1);
         ggml_metal_encoder_set_buffer(enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst,  3);
-        ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
+        ggml_metal_encoder_set_buffer(enc, bid_src2_mv, 4);
 
         const int64_t _ne1 = 1;
         const int64_t ne123 = ne20*ne21;

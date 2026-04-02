@@ -4676,6 +4676,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 }
             }
         }
+
+        if (il != -1 && model.flash_moe_slot_bank_enabled() &&
+                (strcmp(name, "ffn_moe_slot_ids") == 0 || strcmp(name, "ffn_moe_slot_ids_native") == 0)) {
+            const auto & dev_layer = model.dev_layer(il);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                }
+            }
+        }
     };
 }
 

@@ -33,6 +33,12 @@ static bool llama_flash_moe_is_routed_tensor_name(const char * name) {
         return false;
     }
 
+    // Per-expert scale tensors (e.g. ffn_down_exps.scale) are small metadata
+    // that stay in the GGUF — they are not routed expert weight data.
+    if (strstr(name, ".scale") != nullptr) {
+        return false;
+    }
+
     return strstr(name, ".ffn_gate_up_exps.") != nullptr ||
            strstr(name, ".ffn_gate_exps.")    != nullptr ||
            strstr(name, ".ffn_up_exps.")      != nullptr ||
@@ -1326,15 +1332,24 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        auto init_tensor_layout = [](ggml_tensor & tensor, ggml_type type, const auto & dims) {
+            memset(&tensor, 0, sizeof(ggml_tensor));
+            tensor.type = type;
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                tensor.ne[dim] = dim < dims.size() ? dims.begin()[dim] : 1;
+                GGML_ASSERT(tensor.ne[dim] >= 1);
+            }
+            tensor.nb[0] = ggml_type_size(type);
+            tensor.nb[1] = ggml_row_size(type, tensor.ne[0]);
+            GGML_ASSERT(tensor.nb[1] >= 1);
+            for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+                tensor.nb[dim] = tensor.nb[dim - 1] * tensor.ne[dim - 1];
+                GGML_ASSERT(tensor.nb[dim] >= 1);
+            }
+        };
+
         ggml_tensor t_meta;
-        memset(&t_meta, 0, sizeof(ggml_tensor));
-        t_meta.type = type;
-        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
-            GGML_ASSERT(t_meta.ne[dim] >= 1);
-            t_meta.nb[dim] = dim == 0 ? ggml_type_size(type) : t_meta.ne[dim-1]*t_meta.nb[dim-1];
-            GGML_ASSERT(t_meta.nb[dim] >= 1);
-        }
+        init_tensor_layout(t_meta, type, ne);
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -1534,15 +1549,24 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
     };
 
     if (files.empty()) {
+        auto init_tensor_layout = [](ggml_tensor & tensor, ggml_type type, const auto & dims) {
+            memset(&tensor, 0, sizeof(ggml_tensor));
+            tensor.type = type;
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                tensor.ne[dim] = dim < dims.size() ? dims.begin()[dim] : 1;
+                GGML_ASSERT(tensor.ne[dim] >= 1);
+            }
+            tensor.nb[0] = ggml_type_size(type);
+            tensor.nb[1] = ggml_row_size(type, tensor.ne[0]);
+            GGML_ASSERT(tensor.nb[1] >= 1);
+            for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+                tensor.nb[dim] = tensor.nb[dim - 1] * tensor.ne[dim - 1];
+                GGML_ASSERT(tensor.nb[dim] >= 1);
+            }
+        };
+
         ggml_tensor t_meta;
-        memset(&t_meta, 0, sizeof(ggml_tensor));
-        t_meta.type = type_override != GGML_TYPE_COUNT ? type_override : GGML_TYPE_F32;
-        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_meta.ne[dim] = dim < ne.size() ? ne[dim] : 1;
-            GGML_ASSERT(t_meta.ne[dim] >= 1);
-            t_meta.nb[dim] = dim == 0 ? ggml_type_size(t_meta.type) : t_meta.ne[dim-1]*t_meta.nb[dim-1];
-            GGML_ASSERT(t_meta.nb[dim] >= 1);
-        }
+        init_tensor_layout(t_meta, type_override != GGML_TYPE_COUNT ? type_override : GGML_TYPE_F32, ne);
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -1557,14 +1581,23 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
     ggml_tensor t_buft_meta;
     ggml_tensor * t_buft = t_meta;
     if (t_meta != nullptr && type_override != GGML_TYPE_COUNT) {
-        memset(&t_buft_meta, 0, sizeof(ggml_tensor));
-        t_buft_meta.type = type_override;
-        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_buft_meta.ne[dim] = dim < ne.size() ? ne[dim] : 1;
-            GGML_ASSERT(t_buft_meta.ne[dim] >= 1);
-            t_buft_meta.nb[dim] = dim == 0 ? ggml_type_size(t_buft_meta.type) : t_buft_meta.ne[dim - 1]*t_buft_meta.nb[dim - 1];
-            GGML_ASSERT(t_buft_meta.nb[dim] >= 1);
-        }
+        auto init_tensor_layout = [](ggml_tensor & tensor, ggml_type type, const auto & dims) {
+            memset(&tensor, 0, sizeof(ggml_tensor));
+            tensor.type = type;
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                tensor.ne[dim] = dim < dims.size() ? dims.begin()[dim] : 1;
+                GGML_ASSERT(tensor.ne[dim] >= 1);
+            }
+            tensor.nb[0] = ggml_type_size(type);
+            tensor.nb[1] = ggml_row_size(type, tensor.ne[0]);
+            GGML_ASSERT(tensor.nb[1] >= 1);
+            for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+                tensor.nb[dim] = tensor.nb[dim - 1] * tensor.ne[dim - 1];
+                GGML_ASSERT(tensor.nb[dim] >= 1);
+            }
+        };
+
+        init_tensor_layout(t_buft_meta, type_override, ne);
         ggml_set_name(&t_buft_meta, ggml_get_name(t_meta));
         t_buft = &t_buft_meta;
     }
@@ -1586,15 +1619,24 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
         return nullptr;
     }
 
+    auto init_tensor_layout = [](ggml_tensor & tensor, ggml_type type, const auto & dims) {
+        memset(&tensor, 0, sizeof(ggml_tensor));
+        tensor.type = type;
+        for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            tensor.ne[dim] = dim < dims.size() ? dims.begin()[dim] : 1;
+            GGML_ASSERT(tensor.ne[dim] >= 1);
+        }
+        tensor.nb[0] = ggml_type_size(type);
+        tensor.nb[1] = ggml_row_size(type, tensor.ne[0]);
+        GGML_ASSERT(tensor.nb[1] >= 1);
+        for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+            tensor.nb[dim] = tensor.nb[dim - 1] * tensor.ne[dim - 1];
+            GGML_ASSERT(tensor.nb[dim] >= 1);
+        }
+    };
+
     ggml_tensor t_virtual;
-    memset(&t_virtual, 0, sizeof(ggml_tensor));
-    t_virtual.type = type_override != GGML_TYPE_COUNT ? type_override : t_meta->type;
-    for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-        t_virtual.ne[dim] = dim < ne.size() ? ne[dim] : 1;
-        GGML_ASSERT(t_virtual.ne[dim] >= 1);
-        t_virtual.nb[dim] = dim == 0 ? ggml_type_size(t_virtual.type) : t_virtual.ne[dim - 1]*t_virtual.nb[dim - 1];
-        GGML_ASSERT(t_virtual.nb[dim] >= 1);
-    }
+    init_tensor_layout(t_virtual, type_override != GGML_TYPE_COUNT ? type_override : t_meta->type, ne);
     ggml_set_name(&t_virtual, ggml_get_name(t_meta));
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_virtual);
