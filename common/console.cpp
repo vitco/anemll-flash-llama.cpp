@@ -41,6 +41,9 @@
 #define ANSI_COLOR_MAGENTA "\x1b[35m"
 #define ANSI_COLOR_CYAN    "\x1b[36m"
 #define ANSI_COLOR_GRAY    "\x1b[90m"
+#define ANSI_COLOR_BRIGHT_BLUE  "\x1b[94m"
+#define ANSI_COLOR_BRIGHT_CYAN  "\x1b[96m"
+#define ANSI_COLOR_BRIGHT_WHITE "\x1b[97m"
 #define ANSI_COLOR_RESET   "\x1b[0m"
 #define ANSI_BOLD          "\x1b[1m"
 
@@ -178,13 +181,13 @@ namespace console {
                     fprintf(out, ANSI_COLOR_RESET);
                     break;
                 case DISPLAY_TYPE_INFO:
-                    fprintf(out, ANSI_COLOR_MAGENTA);
+                    fprintf(out, ANSI_BOLD ANSI_COLOR_BRIGHT_CYAN);
                     break;
                 case DISPLAY_TYPE_PROMPT:
-                    fprintf(out, ANSI_COLOR_YELLOW);
+                    fprintf(out, ANSI_BOLD ANSI_COLOR_BRIGHT_BLUE);
                     break;
                 case DISPLAY_TYPE_REASONING:
-                    fprintf(out, ANSI_COLOR_GRAY);
+                    fprintf(out, ANSI_COLOR_BRIGHT_WHITE);
                     break;
                 case DISPLAY_TYPE_USER_INPUT:
                     fprintf(out, ANSI_BOLD ANSI_COLOR_GREEN);

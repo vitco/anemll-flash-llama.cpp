@@ -19,6 +19,11 @@ struct llama_ubatch;
 struct llama_model_loader;
 struct llama_flash_moe_sidecar_entry;
 
+enum class llama_flash_moe_sidecar_format : uint8_t {
+    gguf_bytes = 0,
+    affine_2bit_qwen397b = 1,
+};
+
 // available models
 enum llm_type {
     LLM_TYPE_UNKNOWN,
@@ -605,13 +610,15 @@ private:
 const char * llm_type_name(llm_type type);
 
 struct llama_flash_moe_sidecar_entry {
-    int32_t     layer             = -1;
-    std::string tensor_name;
-    std::string tensor_family;
-    std::string repacked_path;
-    size_t      repacked_offset   = 0;
-    size_t      exact_byte_length = 0;
-    size_t      bytes_per_expert  = 0;
+    int32_t                         layer             = -1;
+    std::string                     tensor_name;
+    std::string                     tensor_family;
+    std::string                     repacked_path;
+    ggml_type                       quant_type        = GGML_TYPE_COUNT;
+    llama_flash_moe_sidecar_format  source_format     = llama_flash_moe_sidecar_format::gguf_bytes;
+    size_t                          repacked_offset   = 0;
+    size_t                          exact_byte_length = 0;
+    size_t                          bytes_per_expert  = 0;
 };
 
 // For internal test use

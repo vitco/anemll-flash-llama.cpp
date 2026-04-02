@@ -24,6 +24,211 @@
 static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
 static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
 
+static bool ggml_metal_experimental_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static bool ggml_metal_env_list_contains_token(const char * list, const char * token) {
+    if (list == NULL || list[0] == '\0' || token == NULL || token[0] == '\0') {
+        return false;
+    }
+
+    const size_t token_len = strlen(token);
+    const char * cur = list;
+
+    while (*cur != '\0') {
+        while (*cur == ' ' || *cur == '\t' || *cur == '\n' || *cur == ',' || *cur == ';' || *cur == ':') {
+            ++cur;
+        }
+
+        const char * start = cur;
+        while (*cur != '\0' && *cur != ' ' && *cur != '\t' && *cur != '\n' && *cur != ',' && *cur != ';' && *cur != ':') {
+            ++cur;
+        }
+
+        const size_t cur_len = (size_t) (cur - start);
+        if (cur_len == token_len && strncmp(start, token, token_len) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ggml_metal_name_contains_any(const char * name, const char * const * needles, size_t count) {
+    if (name == NULL || name[0] == '\0') {
+        return false;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        if (needles[i] != NULL && strstr(name, needles[i]) != NULL) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static const char * ggml_metal_tensor_name_or_view_src(const struct ggml_tensor * t) {
+    if (t == NULL) {
+        return NULL;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name != NULL && name[0] != '\0') {
+        return name;
+    }
+
+    if (t->view_src != NULL) {
+        name = ggml_get_name(t->view_src);
+        if (name != NULL && name[0] != '\0') {
+            return name;
+        }
+    }
+
+    return NULL;
+}
+
+static bool ggml_metal_flash_moe_tensor_is_routed(const struct ggml_tensor * t) {
+    static const char * const routed_needles[] = {
+        ".ffn_gate_exps",
+        ".ffn_up_exps",
+        ".ffn_down_exps",
+        "ffn_moe_",
+        "selected_experts",
+        "slot_ids",
+    };
+
+    return ggml_metal_name_contains_any(
+            ggml_metal_tensor_name_or_view_src(t),
+            routed_needles,
+            sizeof(routed_needles)/sizeof(routed_needles[0]));
+}
+
+static bool ggml_metal_flash_moe_tensor_is_shared(const struct ggml_tensor * t) {
+    static const char * const shared_needles[] = {
+        ".ffn_gate_shexp",
+        ".ffn_up_shexp",
+        ".ffn_down_shexp",
+        ".ffn_gate_inp_shexp",
+        "ffn_shexp",
+        "shared_gate",
+    };
+
+    return ggml_metal_name_contains_any(
+            ggml_metal_tensor_name_or_view_src(t),
+            shared_needles,
+            sizeof(shared_needles)/sizeof(shared_needles[0]));
+}
+
+static bool ggml_metal_flash_moe_tensor_is_routed_post(const struct ggml_tensor * t) {
+    static const char * const routed_post_needles[] = {
+        "ffn_moe_swiglu",
+        "ffn_moe_silu",
+        "ffn_moe_geglu",
+        "ffn_moe_gelu",
+        "ffn_moe_reglu",
+        "ffn_moe_relu",
+        "ffn_moe_down",
+        "ffn_moe_weighted",
+        "ffn_moe_out",
+    };
+
+    return ggml_metal_name_contains_any(
+            ggml_metal_tensor_name_or_view_src(t),
+            routed_post_needles,
+            sizeof(routed_post_needles)/sizeof(routed_post_needles[0]));
+}
+
+static bool ggml_metal_flash_moe_op_is_routed(const struct ggml_tensor * op) {
+    if (ggml_metal_flash_moe_tensor_is_routed(op)) {
+        return true;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_metal_flash_moe_tensor_is_routed(op->src[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ggml_metal_flash_moe_op_is_routed_post(const struct ggml_tensor * op) {
+    if (ggml_metal_flash_moe_tensor_is_routed_post(op)) {
+        return true;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_metal_flash_moe_tensor_is_routed_post(op->src[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ggml_metal_flash_moe_op_is_shared(const struct ggml_tensor * op) {
+    if (ggml_metal_flash_moe_tensor_is_shared(op)) {
+        return true;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_metal_flash_moe_tensor_is_shared(op->src[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ggml_metal_flash_moe_disable_routed_enabled(void) {
+    return ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_ROUTED");
+}
+
+static bool ggml_metal_flash_moe_routed_only_enabled(void) {
+    return ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_ROUTED_ONLY");
+}
+
+static bool ggml_metal_flash_moe_disable_routed_post_enabled(void) {
+    return ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_ROUTED_POST");
+}
+
+static const char * ggml_metal_flash_moe_disable_routed_types_env(void) {
+    return getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_ROUTED_TYPES");
+}
+
+static const char * ggml_metal_flash_moe_disable_shared_types_env(void) {
+    return getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_SHARED_TYPES");
+}
+
+static bool ggml_metal_tensor_type_matches_env_list(const struct ggml_tensor * t, const char * list) {
+    if (t == NULL || list == NULL || list[0] == '\0') {
+        return false;
+    }
+
+    return ggml_metal_env_list_contains_token(list, ggml_type_name(t->type));
+}
+
+static bool ggml_metal_flash_moe_op_matches_type_filter(const struct ggml_tensor * op, const char * list) {
+    if (op == NULL || list == NULL || list[0] == '\0') {
+        return false;
+    }
+
+    if (ggml_metal_tensor_type_matches_env_list(op, list)) {
+        return true;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_metal_tensor_type_matches_env_list(op->src[i], list)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 #if !GGML_METAL_EMBED_LIBRARY
 // Here to assist with NSBundle Path Hack
 @interface GGMLMetalClass : NSObject
@@ -997,6 +1202,32 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
+    const bool flash_moe_routed        = ggml_metal_flash_moe_op_is_routed(op);
+    const bool flash_moe_routed_post   = ggml_metal_flash_moe_op_is_routed_post(op);
+    const bool flash_moe_shared        = ggml_metal_flash_moe_op_is_shared(op);
+    const bool flash_moe_isolation_eligible = op->op != GGML_OP_NONE && (flash_moe_routed || flash_moe_shared);
+
+    if (flash_moe_isolation_eligible && ggml_metal_flash_moe_disable_routed_enabled() && flash_moe_routed) {
+        return false;
+    }
+
+    if (flash_moe_isolation_eligible && ggml_metal_flash_moe_routed_only_enabled() && !flash_moe_routed) {
+        return false;
+    }
+
+    if (flash_moe_isolation_eligible && ggml_metal_flash_moe_disable_routed_post_enabled() && flash_moe_routed_post) {
+        return false;
+    }
+
+    if (flash_moe_isolation_eligible && flash_moe_routed &&
+        ggml_metal_flash_moe_op_matches_type_filter(op, ggml_metal_flash_moe_disable_routed_types_env())) {
+        return false;
+    }
+
+    if (flash_moe_isolation_eligible && flash_moe_shared &&
+        ggml_metal_flash_moe_op_matches_type_filter(op, ggml_metal_flash_moe_disable_shared_types_env())) {
+        return false;
+    }
 
     if (!has_bfloat) {
         if (op->type == GGML_TYPE_BF16) {
@@ -1160,7 +1391,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
+            if (ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_MUL_MAT")) {
+                return false;
+            }
+            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_MUL_MAT_ID:
+            if (ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_MUL_MAT_ID")) {
+                return false;
+            }
             return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:
         case GGML_OP_CPY:
@@ -1219,6 +1457,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
+            if (ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_GET_ROWS")) {
+                return false;
+            }
             return op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET_ROWS:
             {

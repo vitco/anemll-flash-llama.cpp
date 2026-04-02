@@ -1383,7 +1383,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
 struct ggml_tensor * llama_model_loader::create_tensor_virtual(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::vector<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::vector<int64_t> & ne, int flags,
+        ggml_type type_override) {
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map_virtual.find(buft);
         if (it == ctx_map_virtual.end()) {
@@ -1535,7 +1536,7 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
     if (files.empty()) {
         ggml_tensor t_meta;
         memset(&t_meta, 0, sizeof(ggml_tensor));
-        t_meta.type = GGML_TYPE_F32;
+        t_meta.type = type_override != GGML_TYPE_COUNT ? type_override : GGML_TYPE_F32;
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
             t_meta.ne[dim] = dim < ne.size() ? ne[dim] : 1;
             GGML_ASSERT(t_meta.ne[dim] >= 1);
@@ -1553,7 +1554,22 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
     }
 
     ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
-    ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
+    ggml_tensor t_buft_meta;
+    ggml_tensor * t_buft = t_meta;
+    if (t_meta != nullptr && type_override != GGML_TYPE_COUNT) {
+        memset(&t_buft_meta, 0, sizeof(ggml_tensor));
+        t_buft_meta.type = type_override;
+        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+            t_buft_meta.ne[dim] = dim < ne.size() ? ne[dim] : 1;
+            GGML_ASSERT(t_buft_meta.ne[dim] >= 1);
+            t_buft_meta.nb[dim] = dim == 0 ? ggml_type_size(t_buft_meta.type) : t_buft_meta.ne[dim - 1]*t_buft_meta.nb[dim - 1];
+            GGML_ASSERT(t_buft_meta.nb[dim] >= 1);
+        }
+        ggml_set_name(&t_buft_meta, ggml_get_name(t_meta));
+        t_buft = &t_buft_meta;
+    }
+
+    ggml_backend_buffer_type_t buft = buft_for_tensor(t_buft);
     if (buft == nullptr) {
         return nullptr;
     }
@@ -1572,7 +1588,7 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
 
     ggml_tensor t_virtual;
     memset(&t_virtual, 0, sizeof(ggml_tensor));
-    t_virtual.type = t_meta->type;
+    t_virtual.type = type_override != GGML_TYPE_COUNT ? type_override : t_meta->type;
     for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
         t_virtual.ne[dim] = dim < ne.size() ? ne[dim] : 1;
         GGML_ASSERT(t_virtual.ne[dim] >= 1);

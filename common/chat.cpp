@@ -64,6 +64,35 @@ static std::string string_diff(const std::string & last, const std::string & cur
     return current.substr(last.size());
 }
 
+static std::string strip_trailing_thinking_marker(const std::string & text,
+                                                  const std::string & thinking_start_tag,
+                                                  const std::string & thinking_end_tag = "") {
+    if (thinking_start_tag.empty()) {
+        return text;
+    }
+
+    size_t trim_end = text.size();
+    while (trim_end > 0 && std::isspace(static_cast<unsigned char>(text[trim_end - 1]))) {
+        trim_end--;
+    }
+
+    if (!thinking_end_tag.empty() &&
+        trim_end >= thinking_end_tag.size() &&
+        text.compare(trim_end - thinking_end_tag.size(), thinking_end_tag.size(), thinking_end_tag) == 0) {
+        trim_end -= thinking_end_tag.size();
+        while (trim_end > 0 && std::isspace(static_cast<unsigned char>(text[trim_end - 1]))) {
+            trim_end--;
+        }
+    }
+
+    if (trim_end >= thinking_start_tag.size() &&
+        text.compare(trim_end - thinking_start_tag.size(), thinking_start_tag.size(), thinking_start_tag) == 0) {
+        return text.substr(0, trim_end - thinking_start_tag.size()) + text.substr(trim_end);
+    }
+
+    return text;
+}
+
 static bool has_content_or_tool_calls(const common_chat_msg & msg) {
     return !msg.content.empty() || !msg.tool_calls.empty();
 }
@@ -1153,21 +1182,34 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
                                                           const autoparser::generation_params & inputs) {
     common_chat_params data;
 
+    const std::string THINK_START = "<think>";
+    const std::string THINK_END   = "</think>";
+    const bool enable_kimi_thinking =
+        inputs.enable_thinking && inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+
     data.prompt             = common_chat_template_direct_apply(tmpl, inputs);
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
-    data.supports_thinking  = true;
+    data.supports_thinking  = enable_kimi_thinking;
     data.preserved_tokens  = {
         "<|tool_calls_section_begin|>",
         "<|tool_calls_section_end|>",
         "<|tool_call_begin|>",
         "<|tool_call_argument_begin|>",
         "<|tool_call_end|>",
-        "<think>",
-        "</think>",
     };
 
+    if (enable_kimi_thinking) {
+        data.preserved_tokens.push_back(THINK_START);
+        data.preserved_tokens.push_back(THINK_END);
+        data.thinking_start_tag = THINK_START;
+        data.thinking_end_tag   = THINK_END;
+    } else {
+        data.prompt = strip_trailing_thinking_marker(data.prompt, THINK_START, THINK_END);
+        data.generation_prompt = strip_trailing_thinking_marker(inputs.generation_prompt, THINK_START, THINK_END);
+    }
+
     auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
-    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+    auto extract_reasoning = enable_kimi_thinking;
     auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
     const std::string SECTION_BEGIN = "<|tool_calls_section_begin|>";
@@ -1175,12 +1217,6 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
     const std::string CALL_BEGIN    = "<|tool_call_begin|>";
     const std::string ARGS_BEGIN    = "<|tool_call_argument_begin|>";
     const std::string CALL_END      = "<|tool_call_end|>";
-
-    const std::string THINK_START = "<think>";
-    const std::string THINK_END   = "</think>";
-
-    data.thinking_start_tag = THINK_START;
-    data.thinking_end_tag   = THINK_END;
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         // Kimi K2 Thinking format:
@@ -1206,7 +1242,7 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
         // Content only parser (no tools)
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
             return wrap_for_generation_prompt(p, reasoning + p.content(p.rest()) + end,
-                inputs, THINK_START);
+                inputs, enable_kimi_thinking ? THINK_START : "");
         }
 
         // Build tool call parsers for each available function
@@ -1243,7 +1279,7 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
         auto content_before_tools = p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN }));
 
         return wrap_for_generation_prompt(p, reasoning + content_before_tools + tool_calls + end,
-            inputs, THINK_START);
+            inputs, enable_kimi_thinking ? THINK_START : "");
     });
 
     data.parser = parser.save();
@@ -1628,7 +1664,9 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     }
 
     if (auto result = try_specialized_template(tmpl, src, params)) {
-        result->generation_prompt = params.generation_prompt;
+        if (result->generation_prompt.empty()) {
+            result->generation_prompt = params.generation_prompt;
+        }
         return *result;
     }
 
@@ -1799,4 +1837,3 @@ std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_tem
     GGML_ASSERT(chat_templates->template_default != nullptr);
     return chat_templates->template_default->caps.to_map();
 }
-

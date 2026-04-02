@@ -84,6 +84,33 @@ static bool ggml_metal_mul_mat_id_experimental_pair_gate_up_enabled(void) {
     return enabled == 1;
 }
 
+static bool ggml_metal_experimental_disable_generic_mm_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_GENERIC_MM");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool ggml_metal_experimental_disable_mul_mm_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_MUL_MM");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1 || ggml_metal_experimental_disable_generic_mm_enabled();
+}
+
+static bool ggml_metal_experimental_disable_mul_mm_id_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_MUL_MM_ID");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1 || ggml_metal_experimental_disable_generic_mm_enabled();
+}
+
 static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_decode_mv_count { 0 };
 static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_generic_mv_count { 0 };
 static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_generic_mm_count { 0 };
@@ -102,7 +129,7 @@ void ggml_metal_op_mul_mat_id_log_stats(void) {
         return;
     }
 
-    GGML_LOG_INFO("%s: mul_mat_id stats decode_mv=%" PRIu64 " pair_gate_up=%" PRIu64 " generic_mv=%" PRIu64 " generic_mm=%" PRIu64 " fused_glu=%" PRIu64 "\n",
+    GGML_LOG_INFO("%s: mul_mat_id dec_mv=%" PRIu64 " pair=%" PRIu64 " gen_mv=%" PRIu64 " gen_mm=%" PRIu64 " fglu=%" PRIu64 "\n",
             __func__, decode_mv, pair_gate_up, generic_mv, generic_mm, fused_glu);
 }
 
@@ -2964,7 +2991,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         !ggml_is_transposed(op->src[1]) &&
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
-        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min) {
+        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min &&
+        !ggml_metal_experimental_disable_mul_mm_enabled()) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         // some Metal matrix data types require aligned pointers
@@ -3203,7 +3231,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
+    if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min) &&
+        !ggml_metal_experimental_disable_mul_mm_id_enabled()) {
         g_ggml_metal_mul_mat_id_generic_mm_count.fetch_add(1);
 
         // some Metal matrix data types require aligned pointers

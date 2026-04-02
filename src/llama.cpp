@@ -863,8 +863,20 @@ static bool llama_flash_moe_experimental_gpu_bank_enabled() {
 }
 
 static bool llama_flash_moe_allow_unsafe_deepseek2_gpu_bank() {
+    const char * disable_value = std::getenv("LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK");
+    if (disable_value != nullptr && disable_value[0] != '\0' && std::strcmp(disable_value, "0") != 0) {
+        return false;
+    }
+
     const char * value = std::getenv("LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK");
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    if (value != nullptr) {
+        return value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    // Default-on for end-user builds: DeepSeek2/Kimi sidecar users should not
+    // need a hidden env var just to reach the routed GPU-bank path. A separate
+    // opt-out remains available for machines that hit hangs or memory pressure.
+    return true;
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
@@ -944,9 +956,9 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
             if (model.arch == LLM_ARCH_DEEPSEEK2 && flash_moe_experimental_gpu_bank) {
                 if (!allow_unsafe_deepseek2_gpu_bank) {
                     throw std::runtime_error(
-                        "Flash-MoE routed GPU-bank placement is currently disabled for DeepSeek2/Kimi sidecar modes in this build while that path is being validated; set LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1 to keep routed banks host-backed while still allowing dense/shared GPU offload, rebuild without LLAMA_FLASH_MOE_GPU_BANK, or set LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK=1 to override at your own risk");
+                        "Flash-MoE routed GPU-bank placement was explicitly disabled for DeepSeek2/Kimi sidecar modes via LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1; set LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1 to keep routed banks host-backed while still allowing dense/shared GPU offload, rebuild without LLAMA_FLASH_MOE_GPU_BANK, or unset LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK to re-enable GPU-bank placement");
                 }
-                LLAMA_LOG_WARN("%s: UNSAFE override enabled via LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK=1; DeepSeek2/Kimi sidecar mode will attempt GPU-bank placement and may hang or exhaust unified memory\n",
+                LLAMA_LOG_WARN("%s: DeepSeek2/Kimi routed GPU-bank placement is enabled; this path may still hang or exhaust unified memory on some machines (set LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1 to force the host-backed routed path)\n",
                         __func__);
             }
         }

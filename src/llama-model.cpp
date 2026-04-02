@@ -71,6 +71,41 @@ static bool llama_flash_moe_is_routed_tensor_name(const char * name) {
            std::strstr(name, ".ffn_down_exps.")    != nullptr;
 }
 
+static ggml_type llama_flash_moe_parse_quant_type(const std::string & value) {
+    if (value.empty()) {
+        return GGML_TYPE_COUNT;
+    }
+
+    std::string normalized = value;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+
+    for (int type = 0; type < GGML_TYPE_COUNT; ++type) {
+        const ggml_type ggml_t = (ggml_type) type;
+        std::string type_name = ggml_type_name(ggml_t);
+        std::transform(type_name.begin(), type_name.end(), type_name.begin(), [](unsigned char c) {
+            return (char) std::tolower(c);
+        });
+        if (normalized == type_name) {
+            return ggml_t;
+        }
+    }
+
+    throw std::runtime_error(format("unknown Flash-MoE quant_type '%s' in sidecar manifest", value.c_str()));
+}
+
+static llama_flash_moe_sidecar_format llama_flash_moe_parse_sidecar_format(const std::string & value) {
+    if (value.empty() || value == "flashmoe_gguf") {
+        return llama_flash_moe_sidecar_format::gguf_bytes;
+    }
+    if (value == "flashmoe_affine_2bit_qwen397b") {
+        return llama_flash_moe_sidecar_format::affine_2bit_qwen397b;
+    }
+
+    throw std::runtime_error(format("unknown Flash-MoE sidecar_kind '%s' in sidecar manifest", value.c_str()));
+}
+
 static bool llama_flash_moe_ctx_is_routed_virtual_bank(ggml_context * ctx) {
     bool saw_tensor = false;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -2828,6 +2863,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         manifest_file >> manifest;
         LLAMA_LOG_INFO("%s: slot-bank parsed manifest %s\n", __func__, manifest_path.string().c_str());
 
+        const auto sidecar_format = llama_flash_moe_parse_sidecar_format(
+                manifest.value("sidecar_kind", std::string("flashmoe_gguf")));
         const auto & entries = manifest.at("entries");
         size_t flash_moe_slot_bytes_all_layers_per_slot = 0;
         int32_t flash_moe_slot_layers = 0;
@@ -2848,6 +2885,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             entry.tensor_name       = tensor_name;
             entry.tensor_family     = tensor_family;
             entry.repacked_path     = (sidecar_dir / item.at("repacked_file").get<std::string>()).string();
+            entry.quant_type        = llama_flash_moe_parse_quant_type(item.value("quant_type", std::string()));
+            entry.source_format     = sidecar_format;
             entry.repacked_offset   = item.at("repacked_offset").get<size_t>();
             entry.exact_byte_length = item.at("exact_byte_length").get<size_t>();
             entry.bytes_per_expert  = item.at("bytes_per_expert").get<size_t>();
@@ -3002,6 +3041,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 return create_tensor(tn, ne, flags);
             }
 
+            const std::string tensor_name = tn.str();
             std::vector<int64_t> dims(ne);
             GGML_ASSERT(!dims.empty());
             dims.back() = flash_moe_slot_count;
@@ -3011,9 +3051,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 routed_buft_list = pimpl->dev_layer.at(tn.bid).buft_list;
             }
 
+            ggml_type type_override = GGML_TYPE_COUNT;
+            const auto it_sidecar = pimpl->flash_moe_sidecar_entries.find(tensor_name);
+            if (it_sidecar != pimpl->flash_moe_sidecar_entries.end()) {
+                type_override = it_sidecar->second.quant_type;
+            }
+
             return ml.create_tensor_virtual(
                 hparams, &pimpl->cpu_buft_list, routed_buft_list, routed_buft_list, routed_buft_list,
-                tn, dims, flags);
+                tn, dims, flags, type_override);
         };
 
         layers.resize(n_layer);

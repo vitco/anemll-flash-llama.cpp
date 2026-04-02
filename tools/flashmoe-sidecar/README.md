@@ -116,7 +116,7 @@ nohup ./llama.cpp/build-flashmoe/bin/llama-cli \
   --moe-trace-harness \
   --no-warmup \
   -fit on \
-  -ub 4 -b 64 \
+  -ub 1 -b 64 \
   -ngl 999 \
   -c 256 \
   --context-shift \
@@ -128,9 +128,11 @@ nohup ./llama.cpp/build-flashmoe/bin/llama-cli \
   > /Users/anemll/Models/flash/logs/kimi-k25-1h-trace.log 2>&1 &
 ```
 
-In the default build, Kimi still keeps the routed bank off GPU.
-`-ngl 999` offloads dense/shared tensors only; routed expert bytes continue to come from the sidecar slot-bank path. Keep `--fit` enabled so dense/shared offload is clamped against the routed slot-bank reserve; do not use `-fit off` for this path unless you are doing an unsafe manual test on purpose.
-Only a special rebuild with `-DLLAMA_FLASH_MOE_GPU_BANK=ON` changes that behavior.
+The default build includes `-DLLAMA_FLASH_MOE_GPU_BANK=ON`, and Kimi/DeepSeek2 GPU-bank placement is enabled by default at runtime.
+`-ngl 999` offloads dense/shared tensors to GPU; routed expert bytes come from the sidecar slot-bank path.
+Keep `--fit` enabled so dense/shared offload is clamped against the routed slot-bank reserve.
+Use `-ub 1` for correct Kimi output; multi-token routed prefill produces degraded results.
+Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-backed path if you hit hangs or memory pressure.
 
 ## Run with the sidecar
 
@@ -173,12 +175,12 @@ If you want a shared-expert-only control run with the same dense/shared placemen
 - Each file concatenates whole-tensor expert payloads in a stable layer/family order.
 - `resident-bank` overrides expert tensors at load time and keeps the dense graph untouched.
 - `slot-bank` reads experts on demand with `pread()` into a small resident slot bank. It is still experimental.
-- In the default build of this fork, `slot-bank` keeps routed expert banks off GPU at compile time, even when `-ngl > 0`. Rebuild with `-DLLAMA_FLASH_MOE_GPU_BANK=ON` only if you explicitly want to test routed GPU-bank placement.
+- The default build includes `-DLLAMA_FLASH_MOE_GPU_BANK=ON`. In slot-bank mode, routed experts stream from SSD via the sidecar path regardless of `-ngl`. Dense/shared weights are offloaded to GPU via `-ngl 99`.
 - For sidecar runs with `-ngl > 0`, keep `--fit` enabled. The fitter is the supported end-user path for clamping dense/shared offload against the routed slot-bank reserve. If you need to deliberately bypass it for a supervised manual test, set `LLAMA_FLASH_MOE_ALLOW_UNFIT_OFFLOAD=1`.
 - `--moe-topk N` is an experimental reduction-only runtime override for routed experts per token. It must be less than or equal to the GGUF model's native MoE top-k.
 - `--moe-shared-only` is an experimental shared-expert-only diagnostic. It is most meaningful on MoE architectures that actually have shared experts, such as Qwen3.5 MoE and Kimi/DeepSeek2.
 - For Qwen3.5 small-memory smoke tests, prefer `--moe-slot-bank 32` or `64`. A slot bank of `256` effectively reserves a full routed-expert bank for that model.
-- Even in a GPU-bank build, DeepSeek2/Kimi routed GPU-bank experiments remain unsafe and still require `LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK=1`.
+- In a GPU-bank build, DeepSeek2/Kimi routed GPU-bank placement is attempted by default. If a machine hits hangs or memory pressure, set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to fall back to the older host-backed routed path.
 - Partial sidecars are supported: any tensor not present in the manifest continues to load from the original GGUF.
 - `flashmoe_cache_estimator.py` models persistent-bank cost from the exact manifest and, when given a trace, reports static-bank, global-budget, and LRU coverage/miss estimates.
 - The default estimator output is terminal-friendly text with ASCII bars; `--svg-out` adds a self-contained dashboard file.

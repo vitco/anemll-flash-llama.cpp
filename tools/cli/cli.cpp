@@ -384,6 +384,8 @@ struct cli_context {
     std::vector<raw_buffer> input_files;
     task_params defaults;
     bool verbose_prompt;
+    common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    int enable_reasoning = -1;
     int reasoning_budget = -1;
     std::string reasoning_budget_message;
 
@@ -402,6 +404,8 @@ struct cli_context {
         // defaults.return_progress = true; // TODO: show progress
 
         verbose_prompt = params.verbose_prompt;
+        reasoning_format = params.reasoning_format;
+        enable_reasoning = params.enable_reasoning;
         reasoning_budget = params.reasoning_budget;
         reasoning_budget_message = params.reasoning_budget_message;
     }
@@ -434,13 +438,15 @@ private:
             if (!raw_prompt.has_value()) {
                 // chat template settings
                 task.params.chat_parser_params = common_chat_parser_params(chat_params);
-                task.params.chat_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+                task.params.chat_parser_params.reasoning_format = reasoning_format;
                 if (!chat_params.parser.empty()) {
                     task.params.chat_parser_params.parser.load(chat_params.parser);
                 }
 
                 // reasoning budget sampler
-                if (reasoning_budget >= 0 && !chat_params.thinking_end_tag.empty()) {
+                if (reasoning_budget >= 0 &&
+                    reasoning_format != COMMON_REASONING_FORMAT_NONE &&
+                    !chat_params.thinking_end_tag.empty()) {
                     const llama_vocab * vocab = llama_model_get_vocab(
                         llama_get_model(ctx_server.get_llama_context()));
 
@@ -557,9 +563,16 @@ public:
         inputs.use_jinja             = chat_params.use_jinja;
         inputs.parallel_tool_calls   = false;
         inputs.add_generation_prompt = true;
-        inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+        inputs.reasoning_format      = reasoning_format;
         inputs.force_pure_content    = chat_params.force_pure_content;
-        inputs.enable_thinking       = chat_params.enable_thinking ? common_chat_templates_support_enable_thinking(chat_params.tmpls.get()) : false;
+        const bool template_supports_thinking = common_chat_templates_support_enable_thinking(chat_params.tmpls.get());
+        if (enable_reasoning == 0 || reasoning_format == COMMON_REASONING_FORMAT_NONE) {
+            inputs.enable_thinking = false;
+        } else if (enable_reasoning == 1) {
+            inputs.enable_thinking = template_supports_thinking;
+        } else {
+            inputs.enable_thinking = chat_params.enable_thinking ? template_supports_thinking : false;
+        }
 
         // Apply chat template to the list of messages
         return common_chat_templates_apply(chat_params.tmpls.get(), inputs);
@@ -740,6 +753,76 @@ int main(int argc, char ** argv) {
     };
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
+
+    // Print Flash-MoE settings before loading
+    if (params.moe_mode != "stock") {
+        auto env_enabled = [](const char * name) -> bool {
+            const char * v = std::getenv(name);
+            return v && v[0] != '\0' && v[0] != '0';
+        };
+        auto env_flag = [&](const char * name) -> const char * {
+            return env_enabled(name) ? "on" : "off";
+        };
+        auto env_value = [](const char * name) -> const char * {
+            const char * v = std::getenv(name);
+            return (v && v[0] != '\0') ? v : "-";
+        };
+        auto deepseek2_gpu_bank_mode = []() -> const char * {
+            const char * disable = std::getenv("LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK");
+            if (disable && disable[0] != '\0' && disable[0] != '0') {
+                return "off";
+            }
+            const char * allow = std::getenv("LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK");
+            if (allow && allow[0] != '\0' && allow[0] != '0') {
+                return "on (forced)";
+            }
+            return "on (default)";
+        };
+        fprintf(stderr, "\nFlash-MoE settings:\n");
+        fprintf(stderr, "  mode             = %s\n", params.moe_mode.c_str());
+        if (!params.moe_sidecar.empty()) {
+            fprintf(stderr, "  sidecar          = %s\n", params.moe_sidecar.c_str());
+        }
+        fprintf(stderr, "  slot-bank        = %d\n", params.moe_slot_bank);
+        fprintf(stderr, "  topk-override    = %d\n", params.moe_topk_override);
+        fprintf(stderr, "  cache-io-split   = %d\n", params.moe_cache_io_split);
+        fprintf(stderr, "  prefetch-temporal = %s\n", params.moe_prefetch_temporal ? "on" : "off");
+        fprintf(stderr, "  shared-only      = %s\n", params.moe_shared_only ? "on" : "off");
+        fprintf(stderr, "  trace-harness    = %s\n", params.moe_trace_harness ? "on" : "off");
+        fprintf(stderr, "  n_gpu_layers     = %d\n", params.n_gpu_layers);
+        {
+#ifdef LLAMA_FLASH_MOE_GPU_BANK
+            bool gpu_bank_compiled = true;
+#else
+            bool gpu_bank_compiled = false;
+#endif
+            bool gpu_bank_disabled = env_enabled("LLAMA_FLASH_MOE_DISABLE_GPU_BANK");
+            bool gpu_bank_effective = gpu_bank_compiled && !gpu_bank_disabled;
+            fprintf(stderr, "  gpu-bank         = %s (compiled=%s, env-disable=%s)\n",
+                    gpu_bank_effective ? "on" : "off",
+                    gpu_bank_compiled ? "on" : "off",
+                    gpu_bank_disabled ? "on" : "off");
+        }
+        fprintf(stderr, "  ds2/kimi-gpu-bank = %s\n", deepseek2_gpu_bank_mode());
+        fprintf(stderr, "  parallel-reads   = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS"));
+        fprintf(stderr, "  async-upload     = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_ASYNC_SLOT_UPLOAD"));
+        fprintf(stderr, "  mixed-slot-buffer= %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_MIXED_SLOT_BUFFER"));
+        fprintf(stderr, "  metal-slot-decode= %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_SLOT_DECODE"));
+        fprintf(stderr, "  metal-split-glu  = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_SPLIT_GLU"));
+        fprintf(stderr, "  metal-disable-mm = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_MUL_MM"));
+        fprintf(stderr, "  metal-disable-mm-id = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_MUL_MM_ID"));
+        fprintf(stderr, "  metal-disable-generic-mm = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_GENERIC_MM"));
+        fprintf(stderr, "  metal-disable-op-mul-mat = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_MUL_MAT"));
+        fprintf(stderr, "  metal-disable-op-mul-mat-id = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_MUL_MAT_ID"));
+        fprintf(stderr, "  metal-disable-op-get-rows = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_GET_ROWS"));
+        fprintf(stderr, "  metal-disable-routed = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_ROUTED"));
+        fprintf(stderr, "  metal-routed-only = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_ROUTED_ONLY"));
+        fprintf(stderr, "  metal-disable-routed-post = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_ROUTED_POST"));
+        fprintf(stderr, "  metal-disable-routed-types = %s\n", env_value("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_ROUTED_TYPES"));
+        fprintf(stderr, "  metal-disable-shared-types = %s\n", env_value("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_SHARED_TYPES"));
+        fprintf(stderr, "  cpu-vis-writes   = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES"));
+        fprintf(stderr, "\n");
+    }
 
     console::log("\nLoading model... "); // followed by loading animation
     console::spinner::start();

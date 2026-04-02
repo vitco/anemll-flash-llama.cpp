@@ -49,6 +49,7 @@ public:
               temporal_prefetch(model.flash_moe_temporal_prefetch_enabled()),
               async_slot_upload(async_slot_upload_enabled()),
               parallel_slot_reads(parallel_slot_reads_enabled()),
+              mixed_slot_buffer(mixed_slot_buffer_enabled()),
               cache_io_split(std::max<int32_t>(model.flash_moe_cache_io_split(), cache_io_split_from_env())) {
         if (const char * path = model.flash_moe_trace_file(); oracle_all_hit || oracle_prefetch) {
             if (path == nullptr || path[0] == '\0') {
@@ -81,6 +82,20 @@ public:
             bind_tensor(layer.ffn_gate_exps,    state.gate_tensor,    state.gate_entry,    state.enabled);
             bind_tensor(layer.ffn_up_exps,      state.up_tensor,      state.up_entry,      state.enabled);
             bind_tensor(layer.ffn_down_exps,    state.down_tensor,    state.down_entry,    state.enabled);
+
+            auto bind_mixed_field = [&](ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry, routed_family family) {
+                if (tensor == nullptr || entry == nullptr) {
+                    return;
+                }
+
+                state.mixed_slot_fields.push_back({ tensor, entry, family, state.mixed_slot_bytes });
+                state.mixed_slot_bytes += entry->bytes_per_expert;
+            };
+
+            bind_mixed_field(state.gate_up_tensor, state.gate_up_entry, routed_family::gate_up);
+            bind_mixed_field(state.gate_tensor,    state.gate_entry,    routed_family::gate);
+            bind_mixed_field(state.up_tensor,      state.up_entry,      routed_family::up);
+            bind_mixed_field(state.down_tensor,    state.down_entry,    routed_family::down);
         }
 
         touched_slots.reserve(slot_count);
@@ -101,6 +116,11 @@ public:
         if (cache_io_split > 1) {
             LLAMA_LOG_INFO("%s: Flash-MoE routed installs will split expert preads into %d page-aligned chunks\n",
                     __func__, cache_io_split);
+        }
+
+        if (mixed_slot_buffer) {
+            LLAMA_LOG_INFO("%s: Flash-MoE mixed slot staging is enabled; miss reads will batch into slot-shaped buffers before tensor uploads\n",
+                    __func__);
         }
 
         if (oracle_all_hit && !model.hparams.no_alloc) {
@@ -518,6 +538,13 @@ private:
         down,
     };
 
+    struct mixed_slot_field {
+        ggml_tensor * tensor = nullptr;
+        const llama_flash_moe_sidecar_entry * entry = nullptr;
+        routed_family family = routed_family::gate;
+        size_t slot_offset = 0;
+    };
+
     struct install_chunk {
         ggml_tensor * tensor = nullptr;
         const llama_flash_moe_sidecar_entry * entry = nullptr;
@@ -527,6 +554,19 @@ private:
         size_t task_begin = 0;
         int32_t task_count = 0;
         std::vector<uint8_t> bytes;
+    };
+
+    struct install_slot_field {
+        const mixed_slot_field * field = nullptr;
+        size_t task_begin = 0;
+        int32_t task_count = 0;
+    };
+
+    struct install_slot_buffer {
+        int32_t expert = -1;
+        int32_t slot = -1;
+        std::vector<uint8_t> bytes;
+        std::vector<install_slot_field> fields;
     };
 
     struct pending_slot_load {
@@ -583,6 +623,8 @@ private:
         std::vector<uint32_t> request_seen_epoch;
         std::vector<int32_t>  request_slot;
         std::vector<int32_t>  temporal_prefetch_experts;
+        std::vector<mixed_slot_field> mixed_slot_fields;
+        size_t mixed_slot_bytes = 0;
         int32_t resident_count = 0;
         int32_t peak_resident_count = 0;
         routed_metrics stats;
@@ -600,6 +642,7 @@ private:
     bool temporal_prefetch = false;
     bool async_slot_upload = false;
     bool parallel_slot_reads = false;
+    bool mixed_slot_buffer = false;
     int32_t cache_io_split = 1;
     bool oracle_primed = false;
     bool oracle_prefetch_primed = false;
@@ -649,6 +692,15 @@ private:
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }
 
+    static bool mixed_slot_buffer_enabled() {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_MIXED_SLOT_BUFFER");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    bool effective_batched_install_reads() const {
+        return parallel_slot_reads && (batched_install_reads_enabled() || cache_io_split > 1);
+    }
+
     static int32_t cache_io_split_from_env() {
         const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_CACHE_IO_SPLIT");
         if (value == nullptr || value[0] == '\0') {
@@ -659,6 +711,11 @@ private:
 
     static bool cpu_visible_slot_writes_enabled() {
         const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    static bool force_backend_tensor_writes_enabled() {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_FORCE_BACKEND_TENSOR_WRITES");
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }
 
@@ -1350,7 +1407,7 @@ private:
         const double miss_bytes_gib = total.bytes_loaded / 1024.0 / 1024.0 / 1024.0;
         const int64_t other_us = total.total_us - total.topk_read_us - total.slot_resolve_us - total.install_us - total.slot_write_us - total.trace_write_us;
 
-        LLAMA_LOG_INFO("%s: Flash-MoE routed summary source=%s calls=%" PRIu64 " refs=%" PRIu64 " unique=%" PRIu64 " hit=%.1f%% misses/call=%.2f bytes=%.2f GiB topk=%.3f ms resolve=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms slot-write=%.3f ms trace=%.3f ms other=%.3f ms pread_ops=%" PRIu64 " resident_copy_ops=%" PRIu64 " io-split=%d async-upload=%s parallel-reads=%s cpu-visible-slot-writes=%s\n",
+        LLAMA_LOG_INFO("%s: Flash-MoE routed src=%s calls=%" PRIu64 " refs=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss/call=%.2f bytes=%.2f GiB topk=%.3f ms resolve=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms slotwr=%.3f ms trace=%.3f ms other=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 " iosplit=%d async=%s preads=%s batchrd=%s mixbuf=%s cpuvis=%s\n",
                 __func__,
                 resident_bank_source ? "resident-packed" :
                 oracle_all_hit ? "oracle-all-hit" :
@@ -1363,22 +1420,24 @@ private:
                 cache_io_split,
                 async_slot_upload ? "on" : "off",
                 parallel_slot_reads ? "on" : "off",
+                effective_batched_install_reads() ? "on" : "off",
+                mixed_slot_buffer ? "on" : "off",
                 cpu_visible_slot_writes_enabled() ? "on" : "off");
         if (total.bytes_loaded > 0 || total.gate_up_install_us > 0 || total.gate_install_us > 0 || total.up_install_us > 0 || total.down_install_us > 0) {
-            LLAMA_LOG_INFO("%s: Flash-MoE install breakdown gate_up=%.3f ms / %.2f GiB gate=%.3f ms / %.2f GiB up=%.3f ms / %.2f GiB down=%.3f ms / %.2f GiB\n",
+            LLAMA_LOG_INFO("%s: Flash-MoE install gate_up=%.3f ms / %.2f GiB gate=%.3f ms / %.2f GiB up=%.3f ms / %.2f GiB down=%.3f ms / %.2f GiB\n",
                     __func__,
                     total.gate_up_install_us / 1000.0, total.gate_up_bytes / 1024.0 / 1024.0 / 1024.0,
                     total.gate_install_us / 1000.0, total.gate_bytes / 1024.0 / 1024.0 / 1024.0,
                     total.up_install_us / 1000.0, total.up_bytes / 1024.0 / 1024.0 / 1024.0,
                     total.down_install_us / 1000.0, total.down_bytes / 1024.0 / 1024.0 / 1024.0);
         }
-        LLAMA_LOG_INFO("%s: Flash-MoE residency summary cold-loads=%" PRIu64 " evict-loads=%" PRIu64 "\n",
+        LLAMA_LOG_INFO("%s: Flash-MoE residency cold=%" PRIu64 " evict=%" PRIu64 "\n",
                 __func__, total.cold_loads, total.evict_loads);
 
         if (prefetch_stats.calls > 0) {
             const double prefetch_hit_pct = prefetch_stats.unique_experts > 0 ?
                     100.0 * double(prefetch_stats.hit_experts) / double(prefetch_stats.unique_experts) : 0.0;
-            LLAMA_LOG_INFO("%s: Flash-MoE prefetch summary calls=%" PRIu64 " unique=%" PRIu64 " hit=%.1f%% misses=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms pread_ops=%" PRIu64 " resident_copy_ops=%" PRIu64 "\n",
+            LLAMA_LOG_INFO("%s: Flash-MoE prefetch calls=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 "\n",
                     __func__,
                     prefetch_stats.calls, prefetch_stats.unique_experts, prefetch_hit_pct, prefetch_stats.miss_experts,
                     prefetch_stats.bytes_loaded / 1024.0 / 1024.0 / 1024.0,
@@ -1418,7 +1477,7 @@ private:
         for (size_t i = 0; i < top_layers; ++i) {
             const auto & [layer, stats] = layer_metrics[i];
             const double layer_hit_pct = stats.unique_experts > 0 ? 100.0 * double(stats.hit_experts) / double(stats.unique_experts) : 0.0;
-            LLAMA_LOG_INFO("%s: Flash-MoE layer-residency layer=%d calls=%" PRIu64 " unique=%" PRIu64 " hit=%.1f%% misses=%" PRIu64 " cold=%" PRIu64 " evict=%" PRIu64 " resident-peak=%d bytes=%.2f MiB install=%.3f ms\n",
+            LLAMA_LOG_INFO("%s: Flash-MoE layer=%d calls=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss=%" PRIu64 " cold=%" PRIu64 " evict=%" PRIu64 " peak=%d bytes=%.2f MiB install=%.3f ms\n",
                     __func__,
                     layer, stats.calls, stats.unique_experts, layer_hit_pct, stats.miss_experts,
                     stats.cold_loads, stats.evict_loads, layers[layer].peak_resident_count,
@@ -1572,21 +1631,182 @@ private:
 
     void write_slot_ids_tensor(ggml_tensor * tensor, const std::vector<int32_t> & values) {
         const size_t bytes = values.size() * sizeof(int32_t);
-        if (uint8_t * dst = tensor_host_data(tensor)) {
-            std::memcpy(dst, values.data(), bytes);
-            return;
+        if (!force_backend_tensor_writes_enabled()) {
+            if (uint8_t * dst = tensor_host_data(tensor)) {
+                std::memcpy(dst, values.data(), bytes);
+                return;
+            }
         }
 
         ggml_backend_tensor_set(tensor, values.data(), 0, bytes);
     }
 
+    bool entry_requires_runtime_transcode(const llama_flash_moe_sidecar_entry * entry) const {
+        return entry != nullptr && entry->source_format != llama_flash_moe_sidecar_format::gguf_bytes;
+    }
+
+    bool layer_has_runtime_transcode(const layer_state & state) const {
+        return entry_requires_runtime_transcode(state.gate_up_entry) ||
+               entry_requires_runtime_transcode(state.gate_entry) ||
+               entry_requires_runtime_transcode(state.up_entry) ||
+               entry_requires_runtime_transcode(state.down_entry);
+    }
+
+    install_metrics transcode_affine_2bit_qwen397b(
+            ggml_tensor * tensor,
+            const llama_flash_moe_sidecar_entry * entry,
+            int32_t expert,
+            uint8_t * out) {
+        static constexpr int32_t affine_group_size = 64;
+        static constexpr size_t affine_expert_size = 3932160;
+
+        struct affine_projection_desc {
+            size_t weight_offset;
+            size_t scale_offset;
+            size_t bias_offset;
+            int32_t rows;
+            int32_t cols;
+            int32_t groups;
+            int32_t packed_cols;
+        };
+
+        const auto projection_desc = [&]() -> affine_projection_desc {
+            if (entry->tensor_family == "ffn_gate_exps") {
+                return { 0, 1048576, 1179648, 1024, 4096, 64, 256 };
+            }
+            if (entry->tensor_family == "ffn_up_exps") {
+                return { 1310720, 2359296, 2490368, 1024, 4096, 64, 256 };
+            }
+            if (entry->tensor_family == "ffn_down_exps") {
+                return { 2621440, 3670016, 3801088, 4096, 1024, 16, 64 };
+            }
+
+            throw std::runtime_error(format(
+                "Flash-MoE affine 2-bit source does not support tensor family '%s' for tensor '%s'",
+                entry->tensor_family.c_str(), entry->tensor_name.c_str()));
+        }();
+
+        if (entry->quant_type == GGML_TYPE_COUNT || !ggml_is_quantized(entry->quant_type)) {
+            throw std::runtime_error(format(
+                "Flash-MoE affine 2-bit source requires a quantized target type for tensor '%s'",
+                entry->tensor_name.c_str()));
+        }
+
+        const int64_t n_per_row = tensor->ne[0];
+        const int64_t nrows = tensor->ne[1];
+        if (n_per_row <= 0 || nrows <= 0) {
+            throw std::runtime_error(format(
+                "Flash-MoE affine 2-bit source received invalid tensor shape for '%s'",
+                entry->tensor_name.c_str()));
+        }
+
+        struct affine_scratch {
+            std::vector<uint8_t> expert_blob;
+            std::vector<float> projection;
+            std::vector<float> aligned;
+        };
+        thread_local affine_scratch scratch;
+
+        scratch.expert_blob.resize(affine_expert_size);
+
+        install_metrics metrics;
+        metrics.bytes = entry->bytes_per_expert;
+
+        const int fd = fd_for(entry->repacked_path);
+        const off_t offset = static_cast<off_t>(entry->repacked_offset + size_t(expert) * affine_expert_size);
+        const int64_t t_read_start_us = ggml_time_us();
+        const ssize_t n_read = pread(fd, scratch.expert_blob.data(), scratch.expert_blob.size(), offset);
+        metrics.pread_ops++;
+        if (n_read != (ssize_t) scratch.expert_blob.size()) {
+            throw std::runtime_error(format(
+                "failed to read affine 2-bit expert %d for tensor '%s' from '%s'",
+                expert, entry->tensor_name.c_str(), entry->repacked_path.c_str()));
+        }
+
+        auto bf16_to_f32 = [](uint16_t bits) -> float {
+            uint32_t word = uint32_t(bits) << 16;
+            float value;
+            std::memcpy(&value, &word, sizeof(value));
+            return value;
+        };
+
+        const uint8_t * blob = scratch.expert_blob.data();
+        const auto * packed = reinterpret_cast<const uint32_t *>(blob + projection_desc.weight_offset);
+        const auto * scales = reinterpret_cast<const uint16_t *>(blob + projection_desc.scale_offset);
+        const auto * biases = reinterpret_cast<const uint16_t *>(blob + projection_desc.bias_offset);
+
+        scratch.projection.resize(size_t(projection_desc.rows) * size_t(projection_desc.cols));
+        for (int32_t row = 0; row < projection_desc.rows; ++row) {
+            float * row_dst = scratch.projection.data() + size_t(row) * size_t(projection_desc.cols);
+            const uint32_t * packed_row = packed + size_t(row) * size_t(projection_desc.packed_cols);
+            const uint16_t * scale_row = scales + size_t(row) * size_t(projection_desc.groups);
+            const uint16_t * bias_row = biases + size_t(row) * size_t(projection_desc.groups);
+
+            for (int32_t group = 0; group < projection_desc.groups; ++group) {
+                const float scale = bf16_to_f32(scale_row[group]);
+                const float bias = bf16_to_f32(bias_row[group]);
+                float * group_dst = row_dst + size_t(group) * affine_group_size;
+                const uint32_t * packed_group = packed_row + size_t(group) * 4;
+
+                for (int32_t word_idx = 0; word_idx < 4; ++word_idx) {
+                    const uint32_t word = packed_group[word_idx];
+                    for (int32_t lane = 0; lane < 16; ++lane) {
+                        const float q = float((word >> (lane * 2)) & 0x3u);
+                        group_dst[word_idx * 16 + lane] = q * scale + bias;
+                    }
+                }
+            }
+        }
+
+        const float * quant_src = nullptr;
+        if (nrows == projection_desc.rows && n_per_row == projection_desc.cols) {
+            quant_src = scratch.projection.data();
+        } else if (nrows == projection_desc.cols && n_per_row == projection_desc.rows) {
+            scratch.aligned.resize(size_t(nrows) * size_t(n_per_row));
+            for (int32_t row = 0; row < projection_desc.rows; ++row) {
+                const float * src_row = scratch.projection.data() + size_t(row) * size_t(projection_desc.cols);
+                for (int32_t col = 0; col < projection_desc.cols; ++col) {
+                    scratch.aligned[size_t(col) * size_t(n_per_row) + size_t(row)] = src_row[col];
+                }
+            }
+            quant_src = scratch.aligned.data();
+        } else {
+            throw std::runtime_error(format(
+                "Flash-MoE affine 2-bit source shape %dx%d does not match tensor '%s' shape %" PRId64 "x%" PRId64,
+                projection_desc.rows, projection_desc.cols, entry->tensor_name.c_str(), nrows, n_per_row));
+        }
+
+        const size_t expected_nbytes = ggml_row_size(entry->quant_type, n_per_row) * size_t(nrows);
+        if (expected_nbytes != entry->bytes_per_expert) {
+            throw std::runtime_error(format(
+                "Flash-MoE affine 2-bit tensor '%s' expects %zu bytes for target type %s but manifest recorded %zu",
+                entry->tensor_name.c_str(), expected_nbytes, ggml_type_name(entry->quant_type), entry->bytes_per_expert));
+        }
+
+        const size_t written = ggml_quantize_chunk(entry->quant_type, quant_src, out, 0, nrows, n_per_row, nullptr);
+        if (written != entry->bytes_per_expert) {
+            throw std::runtime_error(format(
+                "Flash-MoE affine 2-bit tensor '%s' quantized to %zu bytes, expected %zu",
+                entry->tensor_name.c_str(), written, entry->bytes_per_expert));
+        }
+
+        metrics.source_us += ggml_time_us() - t_read_start_us;
+        metrics.install_us += metrics.source_us;
+        return metrics;
+    }
+
     install_metrics read_expert_bytes(
+            ggml_tensor * tensor,
             const llama_flash_moe_sidecar_entry * entry,
             int32_t expert,
             uint8_t * out) {
         install_metrics metrics;
         if (entry == nullptr || out == nullptr) {
             return metrics;
+        }
+
+        if (entry->source_format == llama_flash_moe_sidecar_format::affine_2bit_qwen397b) {
+            return transcode_affine_2bit_qwen397b(tensor, entry, expert, out);
         }
 
         const off_t offset = static_cast<off_t>(entry->repacked_offset + size_t(expert) * entry->bytes_per_expert);
@@ -1686,11 +1906,13 @@ private:
         }
 
         const int64_t t_upload_start_us = ggml_time_us();
-        if (uint8_t * base = tensor_cpu_visible_data(tensor)) {
-            uint8_t * dst = base + size_t(slot) * entry->bytes_per_expert;
-            std::memcpy(dst, src, entry->bytes_per_expert);
-            metrics.install_us += ggml_time_us() - t_upload_start_us;
-            return metrics;
+        if (!force_backend_tensor_writes_enabled()) {
+            if (uint8_t * base = tensor_cpu_visible_data(tensor)) {
+                uint8_t * dst = base + size_t(slot) * entry->bytes_per_expert;
+                std::memcpy(dst, src, entry->bytes_per_expert);
+                metrics.install_us += ggml_time_us() - t_upload_start_us;
+                return metrics;
+            }
         }
 
         if (async_slot_uploader * uploader = get_async_uploader(tensor, entry->bytes_per_expert)) {
@@ -1738,7 +1960,7 @@ private:
         }
 
         staging.resize(entry->bytes_per_expert);
-        metrics = read_expert_bytes(entry, expert, staging.data());
+        metrics = read_expert_bytes(tensor, entry, expert, staging.data());
         const auto upload = upload_expert_bytes(tensor, entry, slot, staging.data());
         metrics.upload_us += upload.upload_us;
         metrics.install_us = ggml_time_us() - t_install_start_us;
@@ -1750,6 +1972,7 @@ private:
         totals.experts = pending_loads.size();
 
         const int64_t t_install_start_us = ggml_time_us();
+        const bool has_runtime_transcode = layer_has_runtime_transcode(state);
         std::vector<pending_slot_load> scheduled_loads;
         scheduled_loads.reserve(pending_loads.size());
 
@@ -1777,113 +2000,223 @@ private:
         };
 
         if (parallel_slot_reads && !resident_bank_source) {
-            if (batched_install_reads_enabled()) {
-                std::vector<install_chunk> chunks;
-                std::vector<pread_task> tasks;
-                chunks.reserve(scheduled_loads.size() * 4);
-                tasks.reserve(scheduled_loads.size() * 4 * std::max<int32_t>(1, cache_io_split));
+            if (!has_runtime_transcode && effective_batched_install_reads()) {
+                if (mixed_slot_buffer && state.mixed_slot_bytes > 0 && !state.mixed_slot_fields.empty()) {
+                    std::vector<install_slot_buffer> slot_buffers;
+                    std::vector<pread_task> tasks;
+                    slot_buffers.reserve(scheduled_loads.size());
+                    tasks.reserve(scheduled_loads.size() * state.mixed_slot_fields.size() * std::max<int32_t>(1, cache_io_split));
 
-                auto queue_chunk = [&](const pending_slot_load & load, ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry, routed_family family) {
-                    if (tensor == nullptr || entry == nullptr) {
-                        return;
-                    }
+                    for (const auto & load : scheduled_loads) {
+                        auto & slot_buffer = slot_buffers.emplace_back();
+                        slot_buffer.expert = load.expert;
+                        slot_buffer.slot = load.slot;
+                        slot_buffer.bytes.resize(state.mixed_slot_bytes);
+                        slot_buffer.fields.reserve(state.mixed_slot_fields.size());
 
-                    auto & chunk = chunks.emplace_back();
-                    chunk.tensor = tensor;
-                    chunk.entry = entry;
-                    chunk.family = family;
-                    chunk.expert = load.expert;
-                    chunk.slot = load.slot;
-                    chunk.bytes.resize(entry->bytes_per_expert);
-                    chunk.task_begin = tasks.size();
+                        for (const auto & field : state.mixed_slot_fields) {
+                            auto & install_field = slot_buffer.fields.emplace_back();
+                            install_field.field = &field;
+                            install_field.task_begin = tasks.size();
 
-                    const int fd = fd_for(entry->repacked_path);
-                    const off_t expert_offset = static_cast<off_t>(entry->repacked_offset + size_t(load.expert) * entry->bytes_per_expert);
-                    const int32_t split = active_cache_io_split(entry->bytes_per_expert, cache_io_split);
-                    chunk.task_count = split;
+                            const int fd = fd_for(field.entry->repacked_path);
+                            const off_t expert_offset = static_cast<off_t>(field.entry->repacked_offset + size_t(load.expert) * field.entry->bytes_per_expert);
+                            const int32_t split = active_cache_io_split(field.entry->bytes_per_expert, cache_io_split);
+                            install_field.task_count = split;
 
-                    if (split <= 1) {
-                        tasks.push_back({
-                                fd,
-                                chunk.bytes.data(),
-                                expert_offset,
-                                entry->bytes_per_expert,
-                                0,
-                                0,
-                        });
-                        return;
-                    }
+                            if (split <= 1) {
+                                tasks.push_back({
+                                        fd,
+                                        slot_buffer.bytes.data() + field.slot_offset,
+                                        expert_offset,
+                                        field.entry->bytes_per_expert,
+                                        0,
+                                        0,
+                                });
+                                continue;
+                            }
 
-                    const size_t total_pages = entry->bytes_per_expert / flash_moe_page_bytes;
-                    size_t page_cursor = 0;
-                    for (int32_t chunk_idx = 0; chunk_idx < split; ++chunk_idx) {
-                        size_t pages_this_chunk = total_pages / (size_t) split;
-                        if ((size_t) chunk_idx < (total_pages % (size_t) split)) {
-                            pages_this_chunk++;
-                        }
-                        const size_t chunk_offset = page_cursor * flash_moe_page_bytes;
-                        const size_t chunk_size = pages_this_chunk * flash_moe_page_bytes;
-                        page_cursor += pages_this_chunk;
+                            const size_t total_pages = field.entry->bytes_per_expert / flash_moe_page_bytes;
+                            size_t page_cursor = 0;
+                            for (int32_t chunk_idx = 0; chunk_idx < split; ++chunk_idx) {
+                                size_t pages_this_chunk = total_pages / (size_t) split;
+                                if ((size_t) chunk_idx < (total_pages % (size_t) split)) {
+                                    pages_this_chunk++;
+                                }
+                                const size_t chunk_offset = page_cursor * flash_moe_page_bytes;
+                                const size_t chunk_size = pages_this_chunk * flash_moe_page_bytes;
+                                page_cursor += pages_this_chunk;
 
-                        tasks.push_back({
-                                fd,
-                                chunk.bytes.data() + chunk_offset,
-                                expert_offset + (off_t) chunk_offset,
-                                chunk_size,
-                                0,
-                                0,
-                        });
-                    }
-                };
-
-                for (const auto & load : scheduled_loads) {
-                    queue_chunk(load, state.gate_up_tensor, state.gate_up_entry, routed_family::gate_up);
-                    queue_chunk(load, state.gate_tensor,    state.gate_entry,    routed_family::gate);
-                    queue_chunk(load, state.up_tensor,      state.up_entry,      routed_family::up);
-                    queue_chunk(load, state.down_tensor,    state.down_entry,    routed_family::down);
-                }
-
-                execute_pread_tasks(tasks);
-
-                for (auto & chunk : chunks) {
-                    install_metrics metrics;
-                    metrics.bytes = chunk.entry->bytes_per_expert;
-
-                    ssize_t total_read = 0;
-                    for (int32_t task_idx = 0; task_idx < chunk.task_count; ++task_idx) {
-                        const auto & task = tasks[chunk.task_begin + size_t(task_idx)];
-                        metrics.pread_ops++;
-                        metrics.source_us += task.elapsed_us;
-                        if (task.result > 0) {
-                            total_read += task.result;
+                                tasks.push_back({
+                                        fd,
+                                        slot_buffer.bytes.data() + field.slot_offset + chunk_offset,
+                                        expert_offset + (off_t) chunk_offset,
+                                        chunk_size,
+                                        0,
+                                        0,
+                                });
+                            }
                         }
                     }
 
-                    if (total_read != (ssize_t) chunk.entry->bytes_per_expert) {
-                        throw std::runtime_error(format(
-                            "failed to split-read expert %d for tensor '%s' from '%s'",
-                            chunk.expert, chunk.entry->tensor_name.c_str(), chunk.entry->repacked_path.c_str()));
+                    execute_pread_tasks(tasks);
+
+                    for (auto & slot_buffer : slot_buffers) {
+                        for (const auto & install_field : slot_buffer.fields) {
+                            const auto & field = *install_field.field;
+                            install_metrics metrics;
+                            metrics.bytes = field.entry->bytes_per_expert;
+
+                            ssize_t total_read = 0;
+                            for (int32_t task_idx = 0; task_idx < install_field.task_count; ++task_idx) {
+                                const auto & task = tasks[install_field.task_begin + size_t(task_idx)];
+                                metrics.pread_ops++;
+                                metrics.source_us += task.elapsed_us;
+                                if (task.result > 0) {
+                                    total_read += task.result;
+                                }
+                            }
+
+                            if (total_read != (ssize_t) field.entry->bytes_per_expert) {
+                                throw std::runtime_error(format(
+                                    "failed to split-read expert %d for tensor '%s' from '%s'",
+                                    slot_buffer.expert, field.entry->tensor_name.c_str(), field.entry->repacked_path.c_str()));
+                            }
+
+                            metrics.install_us += metrics.source_us;
+                            const auto upload = upload_expert_bytes(
+                                    field.tensor,
+                                    field.entry,
+                                    slot_buffer.slot,
+                                    slot_buffer.bytes.data() + field.slot_offset);
+                            metrics.upload_us += upload.upload_us;
+                            metrics.install_us += upload.install_us;
+                            add_family_install(metrics, field.family, metrics.install_us, metrics.bytes);
+
+                            switch (field.family) {
+                                case routed_family::gate_up:
+                                    accumulate_install(metrics, totals.gate_up_install_us, totals.gate_up_bytes);
+                                    break;
+                                case routed_family::gate:
+                                    accumulate_install(metrics, totals.gate_install_us, totals.gate_bytes);
+                                    break;
+                                case routed_family::up:
+                                    accumulate_install(metrics, totals.up_install_us, totals.up_bytes);
+                                    break;
+                                case routed_family::down:
+                                    accumulate_install(metrics, totals.down_install_us, totals.down_bytes);
+                                    break;
+                            }
+                        }
+                    }
+                } else {
+                    std::vector<install_chunk> chunks;
+                    std::vector<pread_task> tasks;
+                    chunks.reserve(scheduled_loads.size() * 4);
+                    tasks.reserve(scheduled_loads.size() * 4 * std::max<int32_t>(1, cache_io_split));
+
+                    auto queue_chunk = [&](const pending_slot_load & load, ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry, routed_family family) {
+                        if (tensor == nullptr || entry == nullptr) {
+                            return;
+                        }
+
+                        auto & chunk = chunks.emplace_back();
+                        chunk.tensor = tensor;
+                        chunk.entry = entry;
+                        chunk.family = family;
+                        chunk.expert = load.expert;
+                        chunk.slot = load.slot;
+                        chunk.bytes.resize(entry->bytes_per_expert);
+                        chunk.task_begin = tasks.size();
+
+                        const int fd = fd_for(entry->repacked_path);
+                        const off_t expert_offset = static_cast<off_t>(entry->repacked_offset + size_t(load.expert) * entry->bytes_per_expert);
+                        const int32_t split = active_cache_io_split(entry->bytes_per_expert, cache_io_split);
+                        chunk.task_count = split;
+
+                        if (split <= 1) {
+                            tasks.push_back({
+                                    fd,
+                                    chunk.bytes.data(),
+                                    expert_offset,
+                                    entry->bytes_per_expert,
+                                    0,
+                                    0,
+                            });
+                            return;
+                        }
+
+                        const size_t total_pages = entry->bytes_per_expert / flash_moe_page_bytes;
+                        size_t page_cursor = 0;
+                        for (int32_t chunk_idx = 0; chunk_idx < split; ++chunk_idx) {
+                            size_t pages_this_chunk = total_pages / (size_t) split;
+                            if ((size_t) chunk_idx < (total_pages % (size_t) split)) {
+                                pages_this_chunk++;
+                            }
+                            const size_t chunk_offset = page_cursor * flash_moe_page_bytes;
+                            const size_t chunk_size = pages_this_chunk * flash_moe_page_bytes;
+                            page_cursor += pages_this_chunk;
+
+                            tasks.push_back({
+                                    fd,
+                                    chunk.bytes.data() + chunk_offset,
+                                    expert_offset + (off_t) chunk_offset,
+                                    chunk_size,
+                                    0,
+                                    0,
+                            });
+                        }
+                    };
+
+                    for (const auto & load : scheduled_loads) {
+                        queue_chunk(load, state.gate_up_tensor, state.gate_up_entry, routed_family::gate_up);
+                        queue_chunk(load, state.gate_tensor,    state.gate_entry,    routed_family::gate);
+                        queue_chunk(load, state.up_tensor,      state.up_entry,      routed_family::up);
+                        queue_chunk(load, state.down_tensor,    state.down_entry,    routed_family::down);
                     }
 
-                    metrics.install_us += metrics.source_us;
-                    const auto upload = upload_expert_bytes(chunk.tensor, chunk.entry, chunk.slot, chunk.bytes.data());
-                    metrics.upload_us += upload.upload_us;
-                    metrics.install_us += upload.install_us;
-                    add_family_install(metrics, chunk.family, metrics.install_us, metrics.bytes);
+                    execute_pread_tasks(tasks);
 
-                    switch (chunk.family) {
-                        case routed_family::gate_up:
-                            accumulate_install(metrics, totals.gate_up_install_us, totals.gate_up_bytes);
-                            break;
-                        case routed_family::gate:
-                            accumulate_install(metrics, totals.gate_install_us, totals.gate_bytes);
-                            break;
-                        case routed_family::up:
-                            accumulate_install(metrics, totals.up_install_us, totals.up_bytes);
-                            break;
-                        case routed_family::down:
-                            accumulate_install(metrics, totals.down_install_us, totals.down_bytes);
-                            break;
+                    for (auto & chunk : chunks) {
+                        install_metrics metrics;
+                        metrics.bytes = chunk.entry->bytes_per_expert;
+
+                        ssize_t total_read = 0;
+                        for (int32_t task_idx = 0; task_idx < chunk.task_count; ++task_idx) {
+                            const auto & task = tasks[chunk.task_begin + size_t(task_idx)];
+                            metrics.pread_ops++;
+                            metrics.source_us += task.elapsed_us;
+                            if (task.result > 0) {
+                                total_read += task.result;
+                            }
+                        }
+
+                        if (total_read != (ssize_t) chunk.entry->bytes_per_expert) {
+                            throw std::runtime_error(format(
+                                "failed to split-read expert %d for tensor '%s' from '%s'",
+                                chunk.expert, chunk.entry->tensor_name.c_str(), chunk.entry->repacked_path.c_str()));
+                        }
+
+                        metrics.install_us += metrics.source_us;
+                        const auto upload = upload_expert_bytes(chunk.tensor, chunk.entry, chunk.slot, chunk.bytes.data());
+                        metrics.upload_us += upload.upload_us;
+                        metrics.install_us += upload.install_us;
+                        add_family_install(metrics, chunk.family, metrics.install_us, metrics.bytes);
+
+                        switch (chunk.family) {
+                            case routed_family::gate_up:
+                                accumulate_install(metrics, totals.gate_up_install_us, totals.gate_up_bytes);
+                                break;
+                            case routed_family::gate:
+                                accumulate_install(metrics, totals.gate_install_us, totals.gate_bytes);
+                                break;
+                            case routed_family::up:
+                                accumulate_install(metrics, totals.up_install_us, totals.up_bytes);
+                                break;
+                            case routed_family::down:
+                                accumulate_install(metrics, totals.down_install_us, totals.down_bytes);
+                                break;
+                        }
                     }
                 }
             } else {
@@ -1906,7 +2239,7 @@ private:
                     chunk.bytes.resize(entry->bytes_per_expert);
 
                     futures.emplace_back(std::async(std::launch::async, [this, &chunk]() {
-                        return read_expert_bytes(chunk.entry, chunk.expert, chunk.bytes.data());
+                        return read_expert_bytes(chunk.tensor, chunk.entry, chunk.expert, chunk.bytes.data());
                     }));
                 };
 

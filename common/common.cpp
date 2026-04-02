@@ -1045,14 +1045,25 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params) :
     pimpl(new impl{}) {
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
-
     const bool flash_moe_sidecar_runtime =
         !params.moe_sidecar.empty() && params.moe_mode != "stock";
+    const bool flash_moe_slot_bank_runtime =
+        params.moe_mode == "slot-bank";
     const bool flash_moe_gpu_offload_requested = params.n_gpu_layers != 0;
     const bool flash_moe_allow_unfit_offload =
         getenv("LLAMA_FLASH_MOE_ALLOW_UNFIT_OFFLOAD") != nullptr;
+
+    if (flash_moe_sidecar_runtime &&
+        flash_moe_slot_bank_runtime &&
+        flash_moe_gpu_offload_requested &&
+        !params.n_ubatch_explicit) {
+        params.n_ubatch = 1;
+        LOG_INF("%s: defaulting Flash-MoE slot-bank GPU runs to -ub 1; pass -ub/--ubatch-size to override\n",
+                __func__);
+    }
+
+    auto mparams = common_model_params_to_llama(params);
+    auto cparams = common_context_params_to_llama(params);
 
     if (flash_moe_sidecar_runtime && flash_moe_gpu_offload_requested && !params.fit_params && !flash_moe_allow_unfit_offload) {
         LOG_ERR("%s: Flash-MoE sidecar runs with GPU offload must keep --fit on in this fork so dense/shared offload is clamped against the routed slot-bank on unified-memory systems; remove '-fit off', use '-ngl 0', or set LLAMA_FLASH_MOE_ALLOW_UNFIT_OFFLOAD=1 for an unsafe manual test\n", __func__);

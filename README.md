@@ -13,10 +13,9 @@ Flash-MoE inference for large GGUF Mixture-of-Experts models on Apple Silicon, u
 ## Current Model Support
 
 - `Qwen3.5` GGUF MoE is the current anchor path for bring-up and regression work.
-- In the default build of this fork, `slot-bank` keeps routed expert banks off GPU at compile time. Use `-ngl 999` with the default `--fit on` path to request maximum dense/shared offload without counting non-MoE layers by hand; the fitter clamps dense/shared placement against the routed slot-bank budget.
-- `Kimi-K2` and `Kimi-K2.5` GGUF support is experimental today: sidecar extraction, slot-bank runtime, trace capture, and bank modeling work, but quality and performance are still being tuned.
-- Experimental routed GPU-bank placement is a separate build-time feature. Rebuild with `-DLLAMA_FLASH_MOE_GPU_BANK=ON` only if you explicitly want to test it.
-- Even in a GPU-bank build, DeepSeek2/Kimi routed GPU-bank experiments remain unsafe and still require `LLAMA_FLASH_MOE_ALLOW_UNSAFE_DEEPSEEK2_GPU_BANK=1`.
+- The recommended build uses `-DLLAMA_FLASH_MOE_GPU_BANK=ON` (the default). In slot-bank mode, routed experts are **not** loaded into GPU memory — they stream from SSD. Use `-ngl 99` to offload dense/shared weights to GPU; the fitter clamps dense/shared placement against the routed slot-bank budget.
+- `Kimi-K2` and `Kimi-K2.5` GGUF support is experimental: sidecar extraction, slot-bank runtime, trace capture, and bank modeling work, but quality and performance are still being tuned. Kimi currently requires `-ub 1` for correct output. The `-ngl 99` dense GPU path produces degraded output on some runs due to a Metal compute issue being investigated.
+- For Kimi/DeepSeek2, GPU-bank placement of routed experts is enabled by default in GPU-bank builds. Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-backed slot-bank path if you hit hangs or memory pressure.
 
 ## Purpose
 
@@ -76,22 +75,38 @@ git clone https://github.com/Anemll/anemll-flash-llama.cpp.git
 cd anemll-flash-llama.cpp
 
 # Metal (Apple Silicon) — recommended
-cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(sysctl -n hw.ncpu) -- llama-cli llama-bench llama-perplexity
+cmake -S . -B build \
+  -DGGML_METAL=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_FLASH_MOE_GPU_BANK=ON
+
+cmake --build build --config Release -j"$(sysctl -n hw.ncpu)" \
+  --target llama-cli llama-bench llama-perplexity
 
 # CUDA (NVIDIA)
-cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc) -- llama-cli llama-bench
+cmake -S . -B build \
+  -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_FLASH_MOE_GPU_BANK=ON
+
+cmake --build build --config Release -j"$(nproc)" \
+  --target llama-cli llama-bench
 
 # CPU-only fallback
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc) -- llama-cli llama-bench
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build build --config Release -j"$(nproc)" \
+  --target llama-cli llama-bench
 ```
 
-To disable GPU-bank placement at compile time (not usually needed — it's also controllable at runtime via `LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1`):
+To disable GPU-bank placement at compile time (also controllable at runtime via `LLAMA_FLASH_MOE_DISABLE_GPU_BANK=1`):
 
 ```bash
-cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_FLASH_MOE_GPU_BANK=OFF
+cmake -S . -B build \
+  -DGGML_METAL=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_FLASH_MOE_GPU_BANK=OFF
 ```
 
 ## Choosing `--moe-slot-bank` Size
@@ -188,10 +203,11 @@ build/bin/llama-cli \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen35 \
   --moe-slot-bank 16 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
-  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
+  -ub 1 -b 64 -ngl 99 -c 256 --seed 0 --temp 0 \
   -p "What is Apple Neural Engine" -n 120
 ```
 
+`-ub 1`: required for correct MoE prefill on GPU — multi-token ubatch produces incorrect output.
 `-ngl 99`: offload dense weights to GPU (use when dense weights fit in VRAM).
 `-ngl 0`: keep everything on CPU (8 GB machines, or when GPU memory is tight).
 `--moe-slot-bank N`: see the sizing table above — 16 for 8 GB, 128 for 128 GB.
@@ -230,13 +246,46 @@ build/bin/llama-cli \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/Kimi-K2.5-sidecar \
   --moe-slot-bank 64 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
-  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
-  -p "What is Apple Neural Engine" -n 100
+  -ub 1 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
+  -p "Compare Apple Neural Engine vs Google's TPU" -n 100
 ```
 
-In the default build, this still keeps the routed bank off GPU.
-`-ngl 999` offloads dense/shared tensors only; routed expert bytes continue to stream through the sidecar slot-bank path. Keep `--fit` on for this path so the fork can clamp dense/shared offload against the routed host-bank budget; do not use `-fit off` here unless you are deliberately doing an unsafe manual test.
-Only a special rebuild with `-DLLAMA_FLASH_MOE_GPU_BANK=ON` changes that behavior.
+In slot-bank mode, routed expert weights are **not** loaded into GPU memory at startup.
+Dense and shared weights are offloaded to GPU via `-ngl 99` as usual.
+Routed experts are streamed from SSD on demand by the slot-bank runtime —
+only the K active experts per token are read, and recently-used experts
+are kept in a host-memory cache (sized by `--moe-slot-bank`).
+
+### Troubleshooting: Trace and Log Output
+
+For debugging slot-bank issues, enable backend tracing, a routing trace file, and verbose logging:
+
+```bash
+env \
+  LLAMA_FLASH_MOE_BACKEND_TRACE=1 \
+  build/bin/llama-cli \
+  --color off --simple-io \
+  -m ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
+  --moe-mode slot-bank --moe-sidecar ~/Models/flash/Kimi-K2.5-sidecar \
+  --moe-slot-bank 64 --moe-topk 4 --moe-prefetch-temporal \
+  --moe-trace /tmp/flashmoe.trace.jsonl \
+  --log-file /tmp/flashmoe.log \
+  --log-prefix --log-timestamps -v \
+  --no-warmup \
+  -ub 1 -b 64 -ngl 99 -c 4096 --seed 0 --temp 0 \
+  -p "What is Apple Neural Engine?" -n 128
+```
+
+Key flags:
+- `LLAMA_FLASH_MOE_BACKEND_TRACE=1` — logs backend-level slot install/eviction events
+- `LLAMA_FLASH_MOE_DEEP_LOG=1` — even more verbose internal logging
+- `--moe-trace /tmp/flashmoe.trace.jsonl` — writes per-token routing decisions (layer, expert ids, slot hits/misses)
+- `--log-file /tmp/flashmoe.log` — redirects all log output to a file
+- `--log-prefix --log-timestamps -v` — adds timestamps and verbose detail to log lines
+
+Output files:
+- `/tmp/flashmoe.trace.jsonl` — one JSON line per token with routing decisions per layer
+- `/tmp/flashmoe.log` — full runtime log with timestamps
 
 ### Sidecar Directory Layout
 
@@ -281,9 +330,11 @@ python3 tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
 
 ## Benchmarks — M5 Max 128 GB
 
+Current Flash-MoE `slot-bank` examples use `-ub 1`. Historical benchmark tables below are kept as recorded experiments; if a benchmark heading or table reflects a different ubatch value, treat that as measurement context rather than the current recommended setting.
+
 **Qwen3.5-35B-A3B-UD-IQ2_M** (256 experts/layer, k→4 via `--moe-topk`, 10.60 GiB, 2.63 BPW)
 
-### Slot-Bank Streaming (sidecar, `-ngl 99 -ub 4 -b 64 -c 256`, 120 tokens)
+### Slot-Bank Streaming (sidecar, `-ngl 99 -ub 1 -b 64 -c 256`, 120 tokens)
 
 Recommended config:
 
@@ -292,7 +343,7 @@ llama-cli -m Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen35 \
   --moe-slot-bank 16 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
-  -ub 4 -b 64 -ngl 99 -c 256 --seed 0 --temp 0 \
+  -ub 1 -b 64 -ngl 99 -c 256 --seed 0 --temp 0 \
   -p “What is Apple Neural Engine” -n 120
 ```
 
@@ -306,7 +357,7 @@ llama-cli -m Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
 
 bank=64-128 is the sweet spot: 53 t/s decode at 82-85% hit rate. bank=256 squeezes out 2 more t/s but doubles resident memory. Temporal prefetch: near-100% hit after warm-up.
 
-### Top-k Reduction (bank=128, `-ngl 99 -ub 4`)
+### Top-k Reduction (bank=128, `-ngl 99 -ub 1`)
 
 | topk | Decode tok/s | Prompt tok/s | Hit % | I/O GiB | pread ops |
 |-----:|-----------:|-----------:|------:|--------:|----------:|
@@ -327,9 +378,9 @@ bank=64-128 is the sweet spot: 53 t/s decode at 82-85% hit rate. bank=256 squeez
 | 16 | 52.4 | 75.6 | |
 | 32 | 50.8 | 73.7 | |
 
-`-ub 2` peaks for decode (56.7 t/s), `-ub 4` is best balanced (54.8 decode + 74.3 prompt).
+`-ub 1` is required for correct MoE prefill on GPU. Multi-token ubatch (`-ub 2` and above) may produce incorrect output with MoE models due to a prefill batching issue.
 
-### Runtime Breakdown (bank=128, `-ngl 99 -ub 4 --moe-topk 4`)
+### Runtime Breakdown (bank=128, `-ngl 99 -ub 1 --moe-topk 4`)
 
 ```
 topk resolve:    0.17 ms   (routing + softmax + top-k selection)
@@ -399,14 +450,14 @@ Trace-harness mode produces coherent, detailed text (tested: RISC vs CISC archit
 
 **Kimi-K2.5-UD-TQ1_0** (256 experts/layer, 60 layers, 217 GB sidecar — real SSD streaming)
 
-### Slot-Bank Streaming (current Kimi safe fallback, `-ngl 0 -ub 4 -b 64 -c 256`, 100 tokens)
+### Slot-Bank Streaming (current Kimi safe fallback, `-ngl 0 -ub 1 -b 64 -c 256`, 100 tokens)
 
 ```bash
 llama-cli -m Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --moe-mode slot-bank --moe-sidecar ~/Models/flash/Kimi-K2.5-sidecar \
   --moe-slot-bank 64 --moe-topk 4 --moe-prefetch-temporal \
   --moe-trace-harness --no-warmup \
-  -ub 4 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
+  -ub 1 -b 64 -ngl 0 -c 256 --seed 0 --temp 0 \
   -p "What is Apple Neural Engine" -n 100
 ```
 
@@ -454,9 +505,53 @@ prefetch:         22.1 ms total (100% hit after warm-up)
 
 SSD throughput: ~4.7 GB/s effective (Apple Fabric, 3.28 MB sequential pread). Bottleneck is pure I/O — the 217 GB sidecar exceeds the 128 GB page cache, so most experts are cold reads from NVMe.
 
-Kimi keeps this `-ngl 0` configuration on purpose in the current fork.
-Unlike Qwen, its GPU-native routed bank path is not yet validated, so `-ngl 999` is not currently a supported sidecar-mode setting there.
-This section is documenting the current safety path, not the intended future end state.
+Kimi currently uses `-ngl 0` as the safe fallback. The `-ngl 99` dense GPU path is faster (4.5 t/s) but produces degraded output on some runs due to a Metal compute issue with the DeepSeek2 architecture. Use `-ngl 99` for speed testing, `-ngl 0` for quality.
+
+## Testing Qwen3.5-397B-A17B (M5 Max 128 GB)
+
+The 397B model uses the same slot-bank workflow as the 35B — just with larger sidecars and more expert layers (60 vs 40).
+
+### 1. Download
+
+```bash
+# Dense GGUF (IQ2_M quantization)
+huggingface-cli download unsloth/Qwen3.5-397B-A17B-GGUF \
+  --include "Qwen3.5-397B-A17B-UD-IQ2_M-*.gguf" \
+  --local-dir ~/Models/Qwen3.5-397B
+
+# Or use a different quantization — check unsloth for available options
+```
+
+### 2. Extract sidecar
+
+```bash
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model ~/Models/Qwen3.5-397B/Qwen3.5-397B-A17B-UD-IQ2_M-00001-of-00005.gguf \
+  --out-dir ~/Models/flash/qwen397b \
+  --force
+
+python3 tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
+  --model ~/Models/Qwen3.5-397B/Qwen3.5-397B-A17B-UD-IQ2_M-00001-of-00005.gguf \
+  --sidecar ~/Models/flash/qwen397b
+```
+
+### 3. Run
+
+```bash
+build/bin/llama-cli \
+  -m ~/Models/Qwen3.5-397B/Qwen3.5-397B-A17B-UD-IQ2_M-00001-of-00005.gguf \
+  --moe-mode slot-bank --moe-sidecar ~/Models/flash/qwen397b \
+  --moe-slot-bank 128 --moe-topk 4 --moe-prefetch-temporal \
+  --moe-trace-harness --no-warmup \
+  -ub 1 -b 64 -ngl 99 -c 256 --seed 0 --temp 0 \
+  -p "What is Apple Neural Engine?" -n 200
+```
+
+Key differences from 35B:
+- `--moe-slot-bank 128` — larger bank for 512 experts/layer (vs 256 for 35B)
+- `-ngl 99` — dense weights (~30 GB) fit in GPU; routed experts (~200+ GB) stream from SSD
+- `-ub 1` — required for correct MoE prefill on GPU
+- Sidecar is multi-shard — pass the first shard, the tool auto-discovers the rest
 
 ## Upstream Base
 

@@ -83,6 +83,8 @@ python3 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py inspect \
 
 This keeps the current Kimi testing shape:
 
+Use `-ub 1` for the current Kimi shape so routing traces match the sane single-token prefill path.
+
 ```bash
 ./llama.cpp/build-flashmoe/bin/llama-cli \
   -m /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
@@ -91,7 +93,7 @@ This keeps the current Kimi testing shape:
   --moe-slot-bank 64 \
   --moe-topk 4 \
   --no-warmup \
-  -ub 4 -b 64 \
+  -ub 1 -b 64 \
   -ngl 0 \
   -c 256 \
   --seed 123 --temp 0 \
@@ -118,7 +120,7 @@ nohup ./llama.cpp/build-flashmoe/bin/llama-cli \
   --moe-prefetch-temporal \
   --moe-trace-harness \
   --no-warmup \
-  -ub 4 -b 64 \
+  -ub 1 -b 64 \
   -ngl 0 \
   -c 256 \
   --context-shift \
