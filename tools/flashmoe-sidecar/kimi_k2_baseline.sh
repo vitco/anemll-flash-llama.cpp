@@ -12,7 +12,7 @@ if [[ -x "${PYTHON_DEFAULT}" ]]; then
 fi
 
 MODEL="${MODEL:-/Users/anemll/Models/Kimi/Kimi-K2-Instruct-UD-TQ1_0-00001-of-00005.gguf}"
-BUILD_DIR="${BUILD_DIR:-${LLAMA_DIR}/build-flashmoe}"
+BUILD_DIR="${BUILD_DIR:-${LLAMA_DIR}/build}"
 RESULTS_DIR="${RESULTS_DIR:-${LLAMA_DIR}/flashmoe-results/kimi-k2}"
 FLASH_ROOT="${FLASH_ROOT:-/Users/anemll/Models/flash}"
 SIDECAR_DIR="${SIDECAR_DIR:-${FLASH_ROOT}/kimi-k2}"

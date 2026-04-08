@@ -73,7 +73,7 @@ Two tools live under [`llama.cpp/tools/flashmoe-sidecar/`](/Users/anemll/SourceR
 ### 1. Inspect the routed geometry
 
 ```bash
-python3 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py inspect \
+python3 ./tools/flashmoe-sidecar/flashmoe_sidecar.py inspect \
   --model /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
   --families routed
@@ -86,7 +86,7 @@ This keeps the current Kimi testing shape:
 Use `-ub 1` for the current Kimi shape so routing traces match the sane single-token prefill path.
 
 ```bash
-./llama.cpp/build-flashmoe/bin/llama-cli \
+./build/bin/llama-cli \
   -m /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --moe-mode slot-bank \
   --moe-sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
@@ -111,7 +111,7 @@ This bypasses the normal chat loop and chat-template stop behavior, so the run k
 ```bash
 mkdir -p /Users/anemll/Models/flash/logs
 
-nohup ./llama.cpp/build-flashmoe/bin/llama-cli \
+nohup ./build/bin/llama-cli \
   -m /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --moe-mode slot-bank \
   --moe-sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
@@ -143,7 +143,7 @@ tail -n 5 /Users/anemll/Models/flash/logs/kimi-k25-1h-trace.log
 ### 4. Estimate persistent-bank cost and coverage
 
 ```bash
-python3 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
+python3 ./tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
   --sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
   --trace /Users/anemll/Models/flash/logs/kimi-k25-1h-trace.jsonl \
   --banks 4 --banks 8 --banks 16 --banks 32 --banks 64 \

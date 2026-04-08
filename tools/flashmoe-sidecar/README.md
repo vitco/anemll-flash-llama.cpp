@@ -14,6 +14,17 @@ Override that root with `FLASH_ROOT=/some/other/path` or set `SIDECAR_DIR` direc
 
 Modeling workflow: [`docs/moe-bank-modeling-workflow.md`](/Users/anemll/SourceRelease/GITHUB/ML_playground/mlx-flash-moe/docs/moe-bank-modeling-workflow.md)
 
+## Model index
+
+Per-model extract + run recipes in this document:
+
+| Model | Arch | Extract | Run |
+|---|---|---|---|
+| Qwen3.5-35B-A3B | qwen3moe | [Extract](#extract-a-qwen35-sidecar) | [Run](#run-with-the-sidecar) |
+| Gemma4-26B-A4B | gemma4 | [Extract](#extract-a-gemma4-26b-a4b-sidecar) | [Run](#run-gemma4-26b-a4b-with-the-sidecar) |
+| Kimi K2 / K2.5 | deepseek2 (MLA) | [Extract](#extract-only-selected-layers) | [Run](#estimate-persistent-bank-cost-and-coverage) |
+| **GLM-5.1** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-51-sidecar) | [**Run**](#run-glm-51-with-the-sidecar) |
+
 ## Current scope
 
 - Supported runtime modes in this build:
@@ -32,7 +43,7 @@ Modeling workflow: [`docs/moe-bank-modeling-workflow.md`](/Users/anemll/SourceRe
 
 ```bash
 PYTHON=python3 \
-./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
   --model /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --out-dir /Users/anemll/Models/flash/qwen35
 ```
@@ -41,17 +52,64 @@ PYTHON=python3 \
 
 ```bash
 PYTHON=python3 \
-./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
   --model /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
   --out-dir /Users/anemll/Models/gemma4/packed_experts \
   --force
 ```
 
+## Extract a GLM-5.1 sidecar
+
+GLM-5.1 (`glm-dsa` arch) is a 256×22B MoE with MLA attention + DeepSeek-style sparse-attention indexer.
+The extractor walks the 6 GGUF shards automatically — point it at the first shard.
+
+```bash
+PYTHON=python3 \
+./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model /Users/anemll/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
+  --out-dir /Users/anemll/Models/flash/GLM-5.1-sidecar
+```
+
+The sidecar is roughly 177 GiB at IQ1_M/IQ2_XXS (76 MoE layers × 256 experts × gate/up/down). Make sure the target SSD has the room.
+
+## Run GLM-5.1 with the sidecar
+
+Daily-driver slot-bank recipe (mirrors the Kimi K2.5 fast-path: `--moe-prefetch-temporal`, `-b 64`, `-ub 1`, `--no-warmup`):
+
+```bash
+./build/bin/llama-cli \
+  -m /Users/anemll/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar /Users/anemll/Models/flash/GLM-5.1-sidecar \
+  --moe-slot-bank 64 \
+  --moe-topk 4 \
+  --moe-prefetch-temporal \
+  --no-warmup \
+  -fit on \
+  -ub 1 -b 64 \
+  -ngl 999 \
+  -c 4096 \
+  --seed 123 --temp 0 \
+  -p "What is Apple Neural Engine?" \
+  -n 128 -st
+```
+
+GLM-5.1 specific notes:
+
+- **`--moe-topk 4`** is a reduction-only override of the model's native K=8. On IQ1_M/IQ2_XXS quants the K=4 vs K=8 quality gap is within noise for general use, while halving per-token expert I/O for ~2× decode. Drop the flag to use native K=8 if you need maximum fidelity.
+- **`--moe-slot-bank 64`** is the starting point. With native K=8 the bank has only 8× headroom; if you have RAM, try `128` or `256` for higher reuse on warm caches.
+- **`--moe-prefetch-temporal`** is the single biggest knob — it overlaps next-layer expert `pread`s with current-layer GPU compute. Always on for SSD-bound MoE.
+- **DSA indexer overhead is structural.** GLM has 79 layers (vs Kimi 61) plus a per-layer sparse-attention indexer that K2.5 doesn't have. Decode is part SSD-bound, part dense-compute-bound — ~3.9 tok/s on M5 Max 128 GB is the current realistic ceiling without quant-kernel work for IQ1_M/IQ2_XXS `mul_mat_id`.
+- If you hit hangs or memory pressure (the DSV2/Kimi GPU-bank path is shared with GLM), fall back with:
+  ```bash
+  LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1 ./build/bin/llama-cli ...
+  ```
+
 ## Verify the sidecar
 
 ```bash
 PYTHON=python3 \
-./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
+./tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
   --model /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --sidecar /Users/anemll/Models/flash/qwen35
 ```
@@ -60,7 +118,7 @@ Gemma4 verification uses the same command shape:
 
 ```bash
 PYTHON=python3 \
-./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
+./tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
   --model /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
   --sidecar /Users/anemll/Models/gemma4/packed_experts
 ```
@@ -69,7 +127,7 @@ PYTHON=python3 \
 
 ```bash
 PYTHON=python3 \
-./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py inspect \
+./tools/flashmoe-sidecar/flashmoe_sidecar.py inspect \
   --model /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --layers 1-2 \
   --families routed \
@@ -80,7 +138,7 @@ PYTHON=python3 \
 
 ```bash
 PYTHON=python3 \
-./llama.cpp/tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
   --model /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --out-dir /Users/anemll/Models/flash/kimi-layer1 \
   --layers 1 \
@@ -91,7 +149,7 @@ PYTHON=python3 \
 ## Estimate persistent-bank cost and coverage
 
 ```bash
-python3 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
+python3 ./tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
   --sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
   --trace /tmp/kimi-k25-trace.jsonl \
   --banks 4 --banks 8 --banks 16 --banks 32 --banks 64 \
@@ -101,7 +159,7 @@ python3 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
 Live terminal dashboard:
 
 ```bash
-python3 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
+python3 ./tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
   --sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
   --trace /Users/anemll/Models/flash/logs/kimi-k25-1h-trace.jsonl \
   --banks 4 --banks 16 --banks 64 \
@@ -112,7 +170,7 @@ python3 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
 Optional dashboard export:
 
 ```bash
-python3 ./llama.cpp/tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
+python3 ./tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
   --sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
   --trace /tmp/kimi-k25-trace.jsonl \
   --banks 4 --banks 16 --banks 64 \
@@ -125,7 +183,7 @@ Long Kimi trace run without the normal `llama-cli` chat-loop exit:
 ```bash
 mkdir -p /Users/anemll/Models/flash/logs
 
-nohup ./llama.cpp/build-flashmoe/bin/llama-cli \
+nohup ./build/bin/llama-cli \
   -m /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --moe-mode slot-bank \
   --moe-sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
@@ -156,7 +214,7 @@ Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-back
 ## Run with the sidecar
 
 ```bash
-./llama.cpp/build-flashmoe/bin/llama-cli \
+./build/bin/llama-cli \
   -m /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --moe-mode resident-bank \
   --moe-sidecar /Users/anemll/Models/flash/qwen35 \
@@ -169,7 +227,7 @@ Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-back
 ## Run a streamed slot-bank smoke test
 
 ```bash
-./llama.cpp/build-flashmoe/bin/llama-cli \
+./build/bin/llama-cli \
   -m /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --moe-mode slot-bank \
   --moe-sidecar /Users/anemll/Models/flash/qwen35 \
@@ -188,7 +246,7 @@ Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-back
 Resident-bank smoke test:
 
 ```bash
-./llama.cpp/build-flashmoe/bin/llama-cli \
+./build/bin/llama-cli \
   --color off --simple-io \
   -m /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
   --moe-mode resident-bank \
@@ -202,7 +260,7 @@ Resident-bank smoke test:
 Streamed slot-bank smoke test:
 
 ```bash
-./llama.cpp/build-flashmoe/bin/llama-cli \
+./build/bin/llama-cli \
   --color off --simple-io \
   -m /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
   --moe-mode slot-bank \

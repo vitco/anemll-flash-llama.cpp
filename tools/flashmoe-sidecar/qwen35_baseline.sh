@@ -12,7 +12,7 @@ if [[ -x "${PYTHON_DEFAULT}" ]]; then
 fi
 
 MODEL="${MODEL:-/Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf}"
-BUILD_DIR="${BUILD_DIR:-${LLAMA_DIR}/build-flashmoe}"
+BUILD_DIR="${BUILD_DIR:-${LLAMA_DIR}/build}"
 RESULTS_DIR="${RESULTS_DIR:-${LLAMA_DIR}/flashmoe-results/qwen35}"
 FLASH_ROOT="${FLASH_ROOT:-/Users/anemll/Models/flash}"
 SIDECAR_DIR="${SIDECAR_DIR:-${FLASH_ROOT}/qwen35}"
