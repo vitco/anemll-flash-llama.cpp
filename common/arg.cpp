@@ -2274,7 +2274,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_TOPK"));
     add_opt(common_arg(
         {"--moe-cache-io-split"}, "N",
-        "split each routed expert pread into N page-aligned chunks during slot-bank installs (1 = disabled, 4 is a good 397B starting point)",
+        "split each routed expert pread into N page-aligned chunks during slot-bank installs (1 = disabled; default: 4)",
         [](common_params & params, int value) {
             if (value < 1) {
                 throw std::invalid_argument("invalid value");

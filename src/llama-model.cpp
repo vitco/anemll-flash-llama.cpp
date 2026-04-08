@@ -467,7 +467,7 @@ struct llama_model::impl {
     bool flash_moe_oracle_prefetch_enabled = false;
     bool flash_moe_temporal_prefetch_enabled = false;
     int32_t flash_moe_slot_bank_size = 0;
-    int32_t flash_moe_cache_io_split = 1;
+    int32_t flash_moe_cache_io_split = 4;
     int32_t moe_n_expert_used = 0;
     std::string flash_moe_trace_file;
     std::unordered_map<std::string, llama_flash_moe_sidecar_entry> flash_moe_sidecar_entries;
@@ -9413,7 +9413,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_prefetch_temporal       =*/ false,
         /*.moe_slot_bank               =*/ 0,
         /*.moe_topk_override           =*/ 0,
-        /*.moe_cache_io_split          =*/ 1,
+        /*.moe_cache_io_split          =*/ 4,
     };
 
     return result;

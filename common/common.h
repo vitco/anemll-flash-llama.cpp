@@ -643,7 +643,7 @@ struct common_params {
     std::string oracle_dump   = "";      // llama-cli tensor oracle dump directory                     // NOLINT
     int32_t     moe_slot_bank = 0;       // reserved slot-bank size                                    // NOLINT
     int32_t     moe_topk_override = 0;   // runtime reduction-only routed-expert override              // NOLINT
-    int32_t     moe_cache_io_split = 1;  // split each routed expert pread into N aligned chunks       // NOLINT
+    int32_t     moe_cache_io_split = 4;  // split each routed expert pread into N aligned chunks       // NOLINT
     int32_t     moe_force_expert = -1;   // force routed selection to a single expert id              // NOLINT
     int32_t     oracle_topk = 32;        // number of final logits to retain in oracle manifests       // NOLINT
     bool        moe_prefetch_temporal = false; // runtime temporal prefetch for slot-bank              // NOLINT
