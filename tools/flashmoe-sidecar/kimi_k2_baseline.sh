@@ -73,6 +73,7 @@ if [[ "${ENABLE_SIDECAR}" == "1" ]]; then
     -m "${MODEL}" \
     --moe-mode resident-bank \
     --moe-sidecar "${SIDECAR_DIR}" \
+    --moe-topk 4 \
     --moe-verify-sidecar \
     -r 1 \
     --no-warmup \
@@ -85,6 +86,7 @@ if [[ "${ENABLE_SIDECAR}" == "1" ]]; then
     -m "${MODEL}" \
     --moe-mode resident-bank \
     --moe-sidecar "${SIDECAR_DIR}" \
+    --moe-topk 4 \
     --moe-verify-sidecar \
     --seed 123 \
     --temp 0 \

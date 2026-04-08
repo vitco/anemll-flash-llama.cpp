@@ -218,6 +218,7 @@ Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-back
   -m /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --moe-mode resident-bank \
   --moe-sidecar /Users/anemll/Models/flash/qwen35 \
+  --moe-topk 4 \
   --moe-verify-sidecar \
   --seed 123 --temp 0 \
   -p "Summarize Flash-MoE in two sentences." \
@@ -233,10 +234,12 @@ Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-back
   --moe-sidecar /Users/anemll/Models/flash/qwen35 \
   --moe-slot-bank 32 \
   --moe-topk 4 \
+  --moe-prefetch-temporal \
+  --no-warmup \
   -fit on \
-  -ub 1 -b 32 \
-  --seed 123 --temp 0 \
+  -ub 1 -b 64 \
   -ngl 999 \
+  --seed 123 --temp 0 \
   -p "What is Apple Neural Engine" \
   -n 32 -st
 ```
@@ -251,6 +254,7 @@ Resident-bank smoke test:
   -m /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
   --moe-mode resident-bank \
   --moe-sidecar /Users/anemll/Models/gemma4/packed_experts \
+  --moe-topk 4 \
   -cnv -st -fit on \
   -ub 1 -b 1 -ngl 0 -c 4096 --seed 0 --temp 0 \
   -p "Make a poem about Apple Neural Engine in 4 lines." \
@@ -266,6 +270,9 @@ Streamed slot-bank smoke test:
   --moe-mode slot-bank \
   --moe-sidecar /Users/anemll/Models/gemma4/packed_experts \
   --moe-slot-bank 16 \
+  --moe-topk 4 \
+  --moe-prefetch-temporal \
+  --no-warmup \
   -cnv -st -fit on \
   -ub 1 -b 1 -ngl 0 -c 4096 --seed 0 --temp 0 \
   -p "Make a poem about Apple Neural Engine in 4 lines." \
@@ -275,7 +282,7 @@ Streamed slot-bank smoke test:
 Gemma4-specific notes:
 
 - `gemma-4-26B-A4B-it` is instruction tuned. For quality comparisons, prefer normal chat mode (`-cnv -st`) over `--moe-trace-harness`, which uses raw completion.
-- Gemma4 uses native `n_expert_used = 8`. Leave `--moe-topk` unset for fidelity unless you are deliberately testing reduced top-k routing.
+- Gemma4's native `n_expert_used = 8`. The default examples above use `--moe-topk 4` to halve per-token expert I/O at minimal quality cost — consistent with the recommendation across models. Drop `--moe-topk 4` to run at native K=8 if you need maximum fidelity.
 - On smaller-memory devices, Gemma4 is more sensitive to slot-bank size than Qwen3.5-35B because each selected expert payload is larger. A slot bank of `8` or `16` is a better starting point than desktop-style larger banks.
 
 In the default build of this fork, Qwen `slot-bank` is expected to use `-ngl 999`.
