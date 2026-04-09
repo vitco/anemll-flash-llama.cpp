@@ -1410,6 +1410,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (flash_moe_slot_runtime->uses_native_slot_map(il)) {
             selected_experts_mm = flash_moe_slot_runtime->build_slot_ids_tensor(ctx0, selected_experts, il);
             cb(selected_experts_mm, "ffn_moe_slot_ids_native", il);
+            // The native slot-id translator is a ggml_map_custom1 callback that runs Flash-MoE
+            // host code; only the CPU backend implements MAP_CUSTOM1. Pin it to CPU so that
+            // when dense/shared tensors are offloaded (e.g. -ngl 999 with Metal), the scheduler
+            // does not greedily place this node on the GPU backend and abort in encode.
+            if (sched != nullptr && backend_cpu != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched, selected_experts_mm, backend_cpu);
+            }
         } else {
             selected_experts_mm = build_inp_moe_slot_ids(il, selected_experts->ne[0], selected_experts->ne[1]);
             cb(selected_experts_mm, "ffn_moe_slot_ids", il);

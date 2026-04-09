@@ -72,6 +72,54 @@ PYTHON=python3 \
 
 The sidecar is roughly 177 GiB at IQ1_M/IQ2_XXS (76 MoE layers × 256 experts × gate/up/down). Make sure the target SSD has the room.
 
+## Export a dense-only GGUF (experimental)
+
+If you already have a verified sidecar, you can also export a compact dense/shared-only GGUF for faster loading and to avoid keeping both the original full GGUF shards and the sidecar on disk.
+
+This path is currently experimental:
+
+- it is tested for `slot-bank` runs
+- it excludes routed expert weight tensors entirely and keeps only dense/shared tensors in the GGUF
+- it still requires the sidecar manifest plus `layer_XXX.bin` files at runtime
+- `flashmoe-package.json` is informational only; `llama-cli` currently loads `model-dense.gguf` directly
+
+Keep the original GGUF shards until you have verified that the dense GGUF + sidecar pair loads correctly on your machine.
+
+GLM-5.1 example:
+
+```bash
+python3 ../local_tools/export_dense_gguf.py \
+  --model /Users/anemll/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
+  --sidecar /Users/anemll/Models/flash/GLM-5.1-sidecar \
+  --out-dir /Users/anemll/Models/GLM/GLM-5.1-IQ1-Dense \
+  --force
+```
+
+Output:
+
+- `/Users/anemll/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf`
+- `/Users/anemll/Models/GLM/GLM-5.1-IQ1-Dense/flashmoe-package.json`
+
+Run the compact dense GGUF with the same sidecar:
+
+```bash
+./build/bin/llama-cli \
+  -m /Users/anemll/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar /Users/anemll/Models/flash/GLM-5.1-sidecar \
+  --moe-slot-bank 64 \
+  --moe-topk 4 \
+  -fit on \
+  -ub 1 -b 64 \
+  -ngl 999 \
+  -c 4096 \
+  --seed 123 --temp 0 \
+  -p "What is Apple Neural Engine?" \
+  -n 128 -st --moe-cache-io-split 4
+```
+
+Compared with the full GLM shard set, the compact dense GGUF is about 14 GiB on disk while routed expert bytes continue to come from the sidecar.
+
 ## Run GLM-5.1 with the sidecar
 
 Daily-driver slot-bank recipe (mirrors the Kimi K2.5 fast-path: `--moe-prefetch-temporal`, `-b 64`, `-ub 1`, `--no-warmup`):
