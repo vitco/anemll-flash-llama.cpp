@@ -2301,6 +2301,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH_TEMPORAL"));
     add_opt(common_arg(
+        {"--moe-predict-prev-token"},
+        {"--no-moe-predict-prev-token"},
+        string_format("enable previous-token same-layer expert prediction for slot-bank decode (default: %s)", params.moe_predict_prev_token ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_predict_prev_token = value;
+            if (value) {
+                params.moe_predict_top1_prev = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREDICT_PREV_TOKEN"));
+    add_opt(common_arg(
+        {"--moe-predict-top1-prev"},
+        {"--no-moe-predict-top1-prev"},
+        string_format("enable previous-token top-1 same-layer expert prediction for slot-bank decode (default: %s)", params.moe_predict_top1_prev ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_predict_top1_prev = value;
+            if (value) {
+                params.moe_predict_prev_token = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREDICT_TOP1_PREV"));
+    add_opt(common_arg(
         {"--moe-shared-only"},
         {"--no-moe-shared-only"},
         string_format("bypass routed experts at graph build time and keep shared experts only (default: %s)", params.moe_shared_only ? "enabled" : "disabled"),

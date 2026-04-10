@@ -590,6 +590,8 @@ struct llama_model {
     bool flash_moe_oracle_all_hit_enabled() const;
     bool flash_moe_oracle_prefetch_enabled() const;
     bool flash_moe_temporal_prefetch_enabled() const;
+    bool flash_moe_predict_prev_token_enabled() const;
+    bool flash_moe_predict_top1_prev_enabled() const;
     int32_t flash_moe_slot_bank_size() const;
     int32_t flash_moe_cache_io_split() const;
     int32_t moe_n_expert_used() const;

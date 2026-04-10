@@ -449,6 +449,9 @@ typedef struct {
     int32_t  nr0;
     int16_t  r2;
     int16_t  r3;
+    uint64_t src0_byte_off;
+    uint64_t src1_byte_off;
+    uint64_t dst_byte_off;
 } ggml_metal_kargs_mul_mv;
 
 typedef struct {

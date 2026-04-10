@@ -610,7 +610,16 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
             return res;
         }
 
-        id<MTLComputePipelineState> obj = [lib->device newComputePipelineStateWithFunction:mtl_function error:&error];
+        id<MTLComputePipelineState> obj = nil;
+        if (ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_ICB")) {
+            MTLComputePipelineDescriptor * desc = [[MTLComputePipelineDescriptor alloc] init];
+            desc.computeFunction = mtl_function;
+            desc.supportIndirectCommandBuffers = YES;
+            obj = [lib->device newComputePipelineStateWithDescriptor:desc options:0 reflection:nil error:&error];
+            [desc release];
+        } else {
+            obj = [lib->device newComputePipelineStateWithFunction:mtl_function error:&error];
+        }
 
         [mtl_function release];
 
@@ -704,6 +713,14 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
+void ggml_metal_encoder_use_resource(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, uint32_t usage) {
+    if (buffer.metal == nil || usage == 0) {
+        return;
+    }
+
+    [encoder->obj useResource:(id<MTLResource>) buffer.metal usage:(MTLResourceUsage) usage];
+}
+
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
@@ -714,6 +731,175 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
+}
+
+struct ggml_metal_owned_buffer {
+    id<MTLBuffer> obj;
+};
+
+ggml_metal_owned_buffer_t ggml_metal_owned_buffer_init(ggml_metal_device_t dev, const void * data, size_t size) {
+    if (dev == NULL || size == 0) {
+        return NULL;
+    }
+
+    ggml_metal_owned_buffer_t res = calloc(1, sizeof(struct ggml_metal_owned_buffer));
+    if (res == NULL) {
+        return NULL;
+    }
+
+    id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
+    res->obj = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    if (res->obj == nil) {
+        free(res);
+        return NULL;
+    }
+
+    if (data != NULL) {
+        memcpy([res->obj contents], data, size);
+    }
+
+    return res;
+}
+
+void ggml_metal_owned_buffer_free(ggml_metal_owned_buffer_t buffer) {
+    if (buffer == NULL) {
+        return;
+    }
+
+    [buffer->obj release];
+    free(buffer);
+}
+
+struct ggml_metal_buffer_id ggml_metal_owned_buffer_get_id(ggml_metal_owned_buffer_t buffer) {
+    struct ggml_metal_buffer_id res = {
+        /* .metal = */ nil,
+        /* .offs  = */ 0,
+    };
+
+    if (buffer != NULL) {
+        res.metal = buffer->obj;
+    }
+
+    return res;
+}
+
+struct ggml_metal_icb {
+    id<MTLIndirectCommandBuffer> obj;
+};
+
+bool ggml_metal_device_supports_compute_icb(ggml_metal_device_t dev) {
+    GGML_UNUSED(dev);
+
+    if (@available(macOS 11.0, iOS 13.0, tvOS 14.0, visionOS 1.0, *)) {
+        return true;
+    }
+
+    return false;
+}
+
+ggml_metal_icb_t ggml_metal_icb_compute_init(
+        ggml_metal_device_t dev,
+        size_t max_command_count,
+        size_t max_kernel_buffer_bind_count) {
+    if (dev == NULL || max_command_count == 0) {
+        return NULL;
+    }
+
+    if (!ggml_metal_device_supports_compute_icb(dev)) {
+        return NULL;
+    }
+
+    ggml_metal_icb_t res = calloc(1, sizeof(struct ggml_metal_icb));
+    if (res == NULL) {
+        return NULL;
+    }
+
+    if (@available(macOS 11.0, iOS 13.0, tvOS 14.0, visionOS 1.0, *)) {
+        id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
+        MTLIndirectCommandBufferDescriptor * desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
+        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+        desc.inheritPipelineState = YES;
+        desc.inheritBuffers = NO;
+        desc.maxKernelBufferBindCount = max_kernel_buffer_bind_count;
+
+        if (@available(macOS 14.0, iOS 17.0, tvOS 17.0, visionOS 1.0, *)) {
+            desc.maxKernelThreadgroupMemoryBindCount = 1;
+        }
+
+        res->obj = [device newIndirectCommandBufferWithDescriptor:desc
+                                                  maxCommandCount:max_command_count
+                                                          options:MTLResourceStorageModeShared];
+        [desc release];
+    }
+
+    if (res->obj == nil) {
+        free(res);
+        return NULL;
+    }
+
+    return res;
+}
+
+void ggml_metal_icb_free(ggml_metal_icb_t icb) {
+    if (icb == NULL) {
+        return;
+    }
+
+    [icb->obj release];
+    free(icb);
+}
+
+bool ggml_metal_icb_encode_compute_dispatch(
+        ggml_metal_icb_t icb,
+        size_t command_index,
+        struct ggml_metal_pipeline_with_params pipeline,
+        struct ggml_metal_buffer_id args,
+        struct ggml_metal_buffer_id src0,
+        struct ggml_metal_buffer_id src1,
+        struct ggml_metal_buffer_id dst,
+        size_t threadgroup_memory_size,
+        int tg0,
+        int tg1,
+        int tg2,
+        int tptg0,
+        int tptg1,
+        int tptg2) {
+    if (icb == NULL || icb->obj == nil || pipeline.pipeline == NULL || pipeline.pipeline->obj == nil) {
+        return false;
+    }
+
+    if (args.metal == nil || src0.metal == nil || src1.metal == nil || dst.metal == nil) {
+        return false;
+    }
+
+    if (@available(macOS 11.0, iOS 13.0, tvOS 14.0, visionOS 1.0, *)) {
+        id<MTLIndirectComputeCommand> cmd = [icb->obj indirectComputeCommandAtIndex:command_index];
+        [cmd reset];
+        [cmd setKernelBuffer:(id<MTLBuffer>) args.metal offset:args.offs atIndex:0];
+        [cmd setKernelBuffer:(id<MTLBuffer>) src0.metal offset:src0.offs atIndex:1];
+        [cmd setKernelBuffer:(id<MTLBuffer>) src1.metal offset:src1.offs atIndex:2];
+        [cmd setKernelBuffer:(id<MTLBuffer>) dst.metal  offset:dst.offs  atIndex:3];
+        [cmd setThreadgroupMemoryLength:threadgroup_memory_size atIndex:0];
+
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2)
+                      threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+        return true;
+    }
+
+    return false;
+}
+
+bool ggml_metal_encoder_execute_icb(ggml_metal_encoder_t encoder, ggml_metal_icb_t icb, size_t n_commands) {
+    if (encoder == NULL || icb == NULL || icb->obj == nil || n_commands == 0) {
+        return false;
+    }
+
+    if (@available(macOS 11.0, iOS 13.0, tvOS 14.0, visionOS 1.0, *)) {
+        [encoder->obj executeCommandsInBuffer:icb->obj withRange:NSMakeRange(0, n_commands)];
+        return true;
+    }
+
+    return false;
 }
 
 struct ggml_metal_device {

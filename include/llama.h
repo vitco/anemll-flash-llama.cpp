@@ -332,6 +332,8 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool moe_verify_sidecar; // validate sidecar metadata parity during model load
         bool moe_prefetch_temporal; // real runtime one-step temporal prefetch on top of slot-bank mode
+        bool moe_predict_prev_token; // prefetch previous token's same-layer routed experts for the next token
+        bool moe_predict_top1_prev; // prefetch only the first previous-token same-layer routed expert for the next token
 
         int32_t moe_slot_bank; // slot-bank resident expert capacity per routed MoE layer
         int32_t moe_topk_override; // runtime reduction-only override for routed experts per token (0 = model metadata)

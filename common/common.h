@@ -647,6 +647,8 @@ struct common_params {
     int32_t     moe_force_expert = -1;   // force routed selection to a single expert id              // NOLINT
     int32_t     oracle_topk = 32;        // number of final logits to retain in oracle manifests       // NOLINT
     bool        moe_prefetch_temporal = false; // runtime temporal prefetch for slot-bank              // NOLINT
+    bool        moe_predict_prev_token = false; // prev-token same-layer expert predictor              // NOLINT
+    bool        moe_predict_top1_prev = false; // prev-token top-1 same-layer predictor               // NOLINT
     bool        moe_shared_only = false; // bypass routed experts and keep shared experts only         // NOLINT
     bool        moe_router_only = false; // keep routing/topk, bypass routed expert matmuls           // NOLINT
     bool        moe_trace_harness = false; // llama-cli raw non-interactive harness for long traces    // NOLINT

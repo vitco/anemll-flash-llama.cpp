@@ -16,6 +16,12 @@
 #include <cstring>
 #include <limits>
 #include <cmath>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
+constexpr uint32_t GGML_METAL_RESOURCE_USAGE_READ  = 1u;
+constexpr uint32_t GGML_METAL_RESOURCE_USAGE_WRITE = 2u;
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -164,6 +170,41 @@ static bool ggml_metal_mul_mat_id_experimental_pair_gate_up_enabled(void) {
     return enabled == 1;
 }
 
+static bool ggml_metal_mul_mat_id_experimental_decode_replay_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_REPLAY");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool ggml_metal_mul_mat_id_experimental_decode_icb_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_ICB");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static size_t ggml_metal_mul_mat_id_experimental_decode_replay_cache_limit(void) {
+    static size_t limit = 0;
+    if (limit == 0) {
+        limit = 8192;
+
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_REPLAY_CACHE_LIMIT");
+        if (value != nullptr && value[0] != '\0') {
+            char * end = nullptr;
+            const unsigned long long parsed = strtoull(value, &end, 10);
+            if (end != value && parsed > 0) {
+                limit = size_t(parsed);
+            }
+        }
+    }
+    return limit;
+}
+
 static bool ggml_metal_experimental_disable_generic_mm_enabled(void) {
     static int enabled = -1;
     if (enabled == -1) {
@@ -197,6 +238,351 @@ static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_generic_mm_count { 0 };
 static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_fused_glu_count { 0 };
 static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_pair_gate_up_count { 0 };
 static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_split_trace_count { 0 };
+static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_decode_replay_hit_count { 0 };
+static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_decode_replay_miss_count { 0 };
+static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_decode_replay_insert_count { 0 };
+static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_decode_replay_clear_count { 0 };
+static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_decode_icb_exec_count { 0 };
+static std::atomic<uint64_t> g_ggml_metal_mul_mat_id_decode_icb_build_fail_count { 0 };
+
+constexpr int64_t GGML_METAL_MUL_MAT_ID_DECODE_REPLAY_MAX_EXPERTS = 32;
+
+struct ggml_metal_mul_mat_id_decode_replay_key {
+    ggml_type src0_type = GGML_TYPE_F32;
+    ggml_type src1_type = GGML_TYPE_F32;
+    int32_t ne00 = 0;
+    int32_t ne01 = 0;
+    int32_t ne02 = 0;
+    int32_t ne10 = 0;
+    int32_t ne11 = 0;
+    int32_t ne0 = 0;
+    uint64_t nb00 = 0;
+    uint64_t nb01 = 0;
+    uint64_t nb02 = 0;
+    uint64_t nb10 = 0;
+    uint64_t nb11 = 0;
+    uint64_t nb_dst1 = 0;
+    int32_t n_experts = 0;
+    bool use_direct_dispatch = false;
+    bool bind_runtime_buffers = false;
+    uintptr_t src0_metal = 0;
+    uintptr_t src1_metal = 0;
+    uintptr_t dst_metal  = 0;
+    uint64_t src0_base_offset = 0;
+    uint64_t src1_base_offset = 0;
+    uint64_t dst_base_offset  = 0;
+    std::array<int32_t, GGML_METAL_MUL_MAT_ID_DECODE_REPLAY_MAX_EXPERTS> expert_ids = {};
+
+    bool operator==(const ggml_metal_mul_mat_id_decode_replay_key & other) const {
+        return src0_type == other.src0_type &&
+                src1_type == other.src1_type &&
+                ne00 == other.ne00 &&
+                ne01 == other.ne01 &&
+                ne02 == other.ne02 &&
+                ne10 == other.ne10 &&
+                ne11 == other.ne11 &&
+                ne0 == other.ne0 &&
+                nb00 == other.nb00 &&
+                nb01 == other.nb01 &&
+                nb02 == other.nb02 &&
+                nb10 == other.nb10 &&
+                nb11 == other.nb11 &&
+                nb_dst1 == other.nb_dst1 &&
+                n_experts == other.n_experts &&
+                use_direct_dispatch == other.use_direct_dispatch &&
+                bind_runtime_buffers == other.bind_runtime_buffers &&
+                src0_metal == other.src0_metal &&
+                src1_metal == other.src1_metal &&
+                dst_metal == other.dst_metal &&
+                src0_base_offset == other.src0_base_offset &&
+                src1_base_offset == other.src1_base_offset &&
+                dst_base_offset == other.dst_base_offset &&
+                expert_ids == other.expert_ids;
+    }
+};
+
+struct ggml_metal_mul_mat_id_decode_replay_key_hash {
+    size_t operator()(const ggml_metal_mul_mat_id_decode_replay_key & key) const {
+        size_t seed = 0;
+        auto hash_combine = [&](size_t value) {
+            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        };
+
+        hash_combine(std::hash<int>{}(int(key.src0_type)));
+        hash_combine(std::hash<int>{}(int(key.src1_type)));
+        hash_combine(std::hash<int32_t>{}(key.ne00));
+        hash_combine(std::hash<int32_t>{}(key.ne01));
+        hash_combine(std::hash<int32_t>{}(key.ne02));
+        hash_combine(std::hash<int32_t>{}(key.ne10));
+        hash_combine(std::hash<int32_t>{}(key.ne11));
+        hash_combine(std::hash<int32_t>{}(key.ne0));
+        hash_combine(std::hash<uint64_t>{}(key.nb00));
+        hash_combine(std::hash<uint64_t>{}(key.nb01));
+        hash_combine(std::hash<uint64_t>{}(key.nb02));
+        hash_combine(std::hash<uint64_t>{}(key.nb10));
+        hash_combine(std::hash<uint64_t>{}(key.nb11));
+        hash_combine(std::hash<uint64_t>{}(key.nb_dst1));
+        hash_combine(std::hash<int32_t>{}(key.n_experts));
+        hash_combine(std::hash<bool>{}(key.use_direct_dispatch));
+        hash_combine(std::hash<bool>{}(key.bind_runtime_buffers));
+        hash_combine(std::hash<uintptr_t>{}(key.src0_metal));
+        hash_combine(std::hash<uintptr_t>{}(key.src1_metal));
+        hash_combine(std::hash<uintptr_t>{}(key.dst_metal));
+        hash_combine(std::hash<uint64_t>{}(key.src0_base_offset));
+        hash_combine(std::hash<uint64_t>{}(key.src1_base_offset));
+        hash_combine(std::hash<uint64_t>{}(key.dst_base_offset));
+        for (int32_t i = 0; i < key.n_experts; ++i) {
+            hash_combine(std::hash<int32_t>{}(key.expert_ids[i]));
+        }
+
+        return seed;
+    }
+};
+
+struct ggml_metal_mul_mat_id_decode_replay_entry {
+    ggml_metal_kargs_mul_mv args = {};
+    size_t smem = 0;
+    int tg0 = 0;
+    int tptg0 = 32;
+    int tptg1 = 1;
+    int n_experts = 0;
+    std::array<uint64_t, GGML_METAL_MUL_MAT_ID_DECODE_REPLAY_MAX_EXPERTS> src0_offsets = {};
+    std::array<uint64_t, GGML_METAL_MUL_MAT_ID_DECODE_REPLAY_MAX_EXPERTS> src1_offsets = {};
+    std::array<uint64_t, GGML_METAL_MUL_MAT_ID_DECODE_REPLAY_MAX_EXPERTS> dst_offsets = {};
+
+    ggml_metal_owned_buffer_t args_buffer = nullptr;
+    ggml_metal_icb_t icb = nullptr;
+
+    ~ggml_metal_mul_mat_id_decode_replay_entry() {
+        ggml_metal_icb_free(icb);
+        ggml_metal_owned_buffer_free(args_buffer);
+    }
+};
+
+static std::mutex g_ggml_metal_mul_mat_id_decode_replay_mutex;
+static std::unordered_map<
+        ggml_metal_mul_mat_id_decode_replay_key,
+        std::shared_ptr<ggml_metal_mul_mat_id_decode_replay_entry>,
+        ggml_metal_mul_mat_id_decode_replay_key_hash> g_ggml_metal_mul_mat_id_decode_replay_cache;
+
+static bool ggml_metal_mul_mat_id_decode_mv_uses_direct_dispatch(const ggml_tensor * op) {
+    if (op == nullptr || op->src[0] == nullptr) {
+        return false;
+    }
+
+    return op->src[0]->type == GGML_TYPE_F32 ||
+            op->src[0]->type == GGML_TYPE_F16 ||
+            op->src[0]->type == GGML_TYPE_BF16 ||
+            op->src[0]->type == GGML_TYPE_Q8_0;
+}
+
+static ggml_metal_mul_mat_id_decode_replay_key ggml_metal_mul_mat_id_decode_replay_make_key(
+        const ggml_tensor * op,
+        const int32_t * expert_ids,
+        int64_t n_experts,
+        bool bind_runtime_buffers) {
+    ggml_metal_mul_mat_id_decode_replay_key key = {};
+
+    key.src0_type = op->src[0]->type;
+    key.src1_type = op->src[1]->type;
+    key.ne00 = op->src[0]->ne[0];
+    key.ne01 = op->src[0]->ne[1];
+    key.ne02 = op->src[0]->ne[2];
+    key.ne10 = op->src[1]->ne[0];
+    key.ne11 = op->src[1]->ne[1];
+    key.ne0 = op->ne[0];
+    key.nb00 = op->src[0]->nb[0];
+    key.nb01 = op->src[0]->nb[1];
+    key.nb02 = op->src[0]->nb[2];
+    key.nb10 = op->src[1]->nb[0];
+    key.nb11 = op->src[1]->nb[1];
+    key.nb_dst1 = op->nb[1];
+    key.n_experts = int32_t(n_experts);
+    key.use_direct_dispatch = ggml_metal_mul_mat_id_decode_mv_uses_direct_dispatch(op);
+    key.bind_runtime_buffers = bind_runtime_buffers;
+
+    if (bind_runtime_buffers) {
+        const ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+        const ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+        const ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+        key.src0_metal = uintptr_t(bid_src0.metal);
+        key.src1_metal = uintptr_t(bid_src1.metal);
+        key.dst_metal  = uintptr_t(bid_dst.metal);
+        key.src0_base_offset = bid_src0.offs;
+        key.src1_base_offset = bid_src1.offs;
+        key.dst_base_offset  = bid_dst.offs;
+    }
+
+    for (int32_t i = 0; i < key.n_experts; ++i) {
+        key.expert_ids[i] = expert_ids[i];
+    }
+
+    return key;
+}
+
+static std::shared_ptr<ggml_metal_mul_mat_id_decode_replay_entry> ggml_metal_mul_mat_id_decode_replay_make_entry(
+        ggml_metal_device_t dev,
+        ggml_metal_library_t lib,
+        const ggml_tensor * op,
+        const int32_t * expert_ids,
+        int64_t n_experts,
+        bool use_icb) {
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+
+    auto entry = std::make_shared<ggml_metal_mul_mat_id_decode_replay_entry>();
+    entry->smem = pipeline.smem;
+    entry->tptg1 = pipeline.nsg;
+    entry->n_experts = int(n_experts);
+
+    const int nr0 = pipeline.nr0;
+
+    entry->args = {
+        /*.ne00 =*/ static_cast<int32_t>(op->src[0]->ne[0]),
+        /*.ne01 =*/ static_cast<int32_t>(op->src[0]->ne[1]),
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ op->src[0]->nb[0],
+        /*.nb01 =*/ op->src[0]->nb[1],
+        /*.nb02 =*/ op->src[0]->nb[2],
+        /*.nb03 =*/ op->src[0]->nb[2],
+        /*.ne10 =*/ static_cast<int32_t>(op->src[1]->ne[0]),
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ op->src[1]->nb[0],
+        /*.nb11 =*/ op->src[1]->nb[1],
+        /*.nb12 =*/ op->src[1]->nb[2],
+        /*.nb13 =*/ op->src[1]->nb[2],
+        /*.ne0  =*/ static_cast<int32_t>(op->ne[0]),
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+        /*.src0_byte_off =*/ 0,
+        /*.src1_byte_off =*/ 0,
+        /*.dst_byte_off  =*/ 0,
+    };
+
+    if (ggml_metal_mul_mat_id_decode_mv_uses_direct_dispatch(op)) {
+        entry->tg0 = (entry->args.ne01 + nr0 - 1) / nr0;
+    } else {
+        entry->tg0 = (entry->args.ne01 + nr0 * pipeline.nsg - 1) / (nr0 * pipeline.nsg);
+    }
+
+    for (int64_t idx_exp = 0; idx_exp < n_experts; ++idx_exp) {
+        const int32_t expert_id = expert_ids[idx_exp];
+        GGML_ASSERT(expert_id >= 0 && expert_id < op->src[0]->ne[2]);
+
+        entry->src0_offsets[idx_exp] = uint64_t(expert_id) * op->src[0]->nb[2];
+        entry->src1_offsets[idx_exp] = uint64_t(idx_exp % op->src[1]->ne[1]) * op->src[1]->nb[1];
+        entry->dst_offsets[idx_exp] = uint64_t(idx_exp) * op->nb[1];
+    }
+
+    if (use_icb && ggml_metal_device_supports_compute_icb(dev)) {
+        std::array<ggml_metal_kargs_mul_mv, GGML_METAL_MUL_MAT_ID_DECODE_REPLAY_MAX_EXPERTS> icb_args = {};
+        const ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+        const ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+        const ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+        for (int idx_exp = 0; idx_exp < entry->n_experts; ++idx_exp) {
+            icb_args[idx_exp] = entry->args;
+            icb_args[idx_exp].src0_byte_off = bid_src0.offs + entry->src0_offsets[idx_exp];
+            icb_args[idx_exp].src1_byte_off = bid_src1.offs + entry->src1_offsets[idx_exp];
+            icb_args[idx_exp].dst_byte_off  = bid_dst.offs  + entry->dst_offsets[idx_exp];
+        }
+
+        entry->args_buffer = ggml_metal_owned_buffer_init(
+                dev,
+                icb_args.data(),
+                size_t(entry->n_experts) * sizeof(icb_args[0]));
+        entry->icb = ggml_metal_icb_compute_init(dev, size_t(n_experts), 4);
+
+        if (entry->args_buffer != nullptr && entry->icb != nullptr) {
+            const ggml_metal_buffer_id bid_args = ggml_metal_owned_buffer_get_id(entry->args_buffer);
+            ggml_metal_buffer_id bid_src0_base = bid_src0;
+            ggml_metal_buffer_id bid_src1_base = bid_src1;
+            ggml_metal_buffer_id bid_dst_base  = bid_dst;
+
+            bid_src0_base.offs = 0;
+            bid_src1_base.offs = 0;
+            bid_dst_base.offs  = 0;
+
+            bool icb_ok = true;
+            for (int idx_exp = 0; idx_exp < entry->n_experts; ++idx_exp) {
+                ggml_metal_buffer_id bid_args_cur = bid_args;
+                bid_args_cur.offs += size_t(idx_exp) * sizeof(icb_args[0]);
+
+                icb_ok = ggml_metal_icb_encode_compute_dispatch(
+                        entry->icb,
+                        size_t(idx_exp),
+                        pipeline,
+                        bid_args_cur,
+                        bid_src0_base,
+                        bid_src1_base,
+                        bid_dst_base,
+                        entry->smem,
+                        entry->tg0,
+                        1,
+                        1,
+                        entry->tptg0,
+                        entry->tptg1,
+                        1);
+                if (!icb_ok) {
+                    break;
+                }
+            }
+
+            if (!icb_ok) {
+                ggml_metal_icb_free(entry->icb);
+                ggml_metal_owned_buffer_free(entry->args_buffer);
+                entry->icb = nullptr;
+                entry->args_buffer = nullptr;
+                g_ggml_metal_mul_mat_id_decode_icb_build_fail_count.fetch_add(1);
+            }
+        } else {
+            ggml_metal_icb_free(entry->icb);
+            ggml_metal_owned_buffer_free(entry->args_buffer);
+            entry->icb = nullptr;
+            entry->args_buffer = nullptr;
+            g_ggml_metal_mul_mat_id_decode_icb_build_fail_count.fetch_add(1);
+        }
+    }
+
+    return entry;
+}
+
+static bool ggml_metal_mul_mat_id_decode_replay_lookup(
+        ggml_metal_device_t dev,
+        ggml_metal_library_t lib,
+        const ggml_tensor * op,
+        const int32_t * expert_ids,
+        int64_t n_experts,
+        bool use_icb,
+        std::shared_ptr<const ggml_metal_mul_mat_id_decode_replay_entry> & entry) {
+    const auto key = ggml_metal_mul_mat_id_decode_replay_make_key(op, expert_ids, n_experts, use_icb);
+
+    std::lock_guard<std::mutex> lock(g_ggml_metal_mul_mat_id_decode_replay_mutex);
+
+    const auto it = g_ggml_metal_mul_mat_id_decode_replay_cache.find(key);
+    if (it != g_ggml_metal_mul_mat_id_decode_replay_cache.end()) {
+        entry = it->second;
+        g_ggml_metal_mul_mat_id_decode_replay_hit_count.fetch_add(1);
+        return true;
+    }
+
+    g_ggml_metal_mul_mat_id_decode_replay_miss_count.fetch_add(1);
+    auto new_entry = ggml_metal_mul_mat_id_decode_replay_make_entry(dev, lib, op, expert_ids, n_experts, use_icb);
+
+    if (g_ggml_metal_mul_mat_id_decode_replay_cache.size() >= ggml_metal_mul_mat_id_experimental_decode_replay_cache_limit()) {
+        g_ggml_metal_mul_mat_id_decode_replay_cache.clear();
+        g_ggml_metal_mul_mat_id_decode_replay_clear_count.fetch_add(1);
+    }
+
+    g_ggml_metal_mul_mat_id_decode_replay_cache.emplace(key, new_entry);
+    g_ggml_metal_mul_mat_id_decode_replay_insert_count.fetch_add(1);
+    entry = new_entry;
+
+    return false;
+}
 
 void ggml_metal_op_mul_mat_id_log_stats(void) {
     const uint64_t decode_mv = g_ggml_metal_mul_mat_id_decode_mv_count.load();
@@ -204,13 +590,48 @@ void ggml_metal_op_mul_mat_id_log_stats(void) {
     const uint64_t generic_mm = g_ggml_metal_mul_mat_id_generic_mm_count.load();
     const uint64_t fused_glu = g_ggml_metal_mul_mat_id_fused_glu_count.load();
     const uint64_t pair_gate_up = g_ggml_metal_mul_mat_id_pair_gate_up_count.load();
+    const uint64_t replay_hit = g_ggml_metal_mul_mat_id_decode_replay_hit_count.load();
+    const uint64_t replay_miss = g_ggml_metal_mul_mat_id_decode_replay_miss_count.load();
+    const uint64_t replay_insert = g_ggml_metal_mul_mat_id_decode_replay_insert_count.load();
+    const uint64_t replay_clear = g_ggml_metal_mul_mat_id_decode_replay_clear_count.load();
+    const uint64_t icb_exec = g_ggml_metal_mul_mat_id_decode_icb_exec_count.load();
+    const uint64_t icb_build_fail = g_ggml_metal_mul_mat_id_decode_icb_build_fail_count.load();
+    size_t replay_cache_size = 0;
 
-    if (decode_mv == 0 && generic_mv == 0 && generic_mm == 0 && fused_glu == 0 && pair_gate_up == 0) {
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_metal_mul_mat_id_decode_replay_mutex);
+        replay_cache_size = g_ggml_metal_mul_mat_id_decode_replay_cache.size();
+    }
+
+    if (decode_mv == 0 && generic_mv == 0 && generic_mm == 0 && fused_glu == 0 && pair_gate_up == 0 &&
+        replay_hit == 0 && replay_miss == 0 && icb_exec == 0 && icb_build_fail == 0) {
         return;
     }
 
-    GGML_LOG_INFO("%s: mul_mat_id dec_mv=%" PRIu64 " pair=%" PRIu64 " gen_mv=%" PRIu64 " gen_mm=%" PRIu64 " fglu=%" PRIu64 "\n",
-            __func__, decode_mv, pair_gate_up, generic_mv, generic_mm, fused_glu);
+    GGML_LOG_INFO("%s: mul_mat_id dec_mv=%" PRIu64 " pair=%" PRIu64 " gen_mv=%" PRIu64 " gen_mm=%" PRIu64
+            " fglu=%" PRIu64 " replay_hit=%" PRIu64 " replay_miss=%" PRIu64
+            " replay_ins=%" PRIu64 " replay_clr=%" PRIu64
+            " icb_exec=%" PRIu64 " icb_fail=%" PRIu64 " replay_cache=%zu\n",
+            __func__, decode_mv, pair_gate_up, generic_mv, generic_mm, fused_glu,
+            replay_hit, replay_miss, replay_insert, replay_clear, icb_exec, icb_build_fail, replay_cache_size);
+}
+
+void ggml_metal_op_mul_mat_id_get_stats(struct ggml_metal_mul_mat_id_stats * stats) {
+    if (stats == nullptr) {
+        return;
+    }
+
+    stats->replay_hit = g_ggml_metal_mul_mat_id_decode_replay_hit_count.load();
+    stats->replay_miss = g_ggml_metal_mul_mat_id_decode_replay_miss_count.load();
+    stats->replay_insert = g_ggml_metal_mul_mat_id_decode_replay_insert_count.load();
+    stats->replay_clear = g_ggml_metal_mul_mat_id_decode_replay_clear_count.load();
+    stats->icb_exec = g_ggml_metal_mul_mat_id_decode_icb_exec_count.load();
+    stats->icb_build_fail = g_ggml_metal_mul_mat_id_decode_icb_build_fail_count.load();
+
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_metal_mul_mat_id_decode_replay_mutex);
+        stats->replay_cache_size = g_ggml_metal_mul_mat_id_decode_replay_cache.size();
+    }
 }
 
 void ggml_metal_op_mul_mat_id_reset_stats(void) {
@@ -220,6 +641,15 @@ void ggml_metal_op_mul_mat_id_reset_stats(void) {
     g_ggml_metal_mul_mat_id_fused_glu_count.store(0);
     g_ggml_metal_mul_mat_id_pair_gate_up_count.store(0);
     g_ggml_metal_mul_mat_id_split_trace_count.store(0);
+    g_ggml_metal_mul_mat_id_decode_replay_hit_count.store(0);
+    g_ggml_metal_mul_mat_id_decode_replay_miss_count.store(0);
+    g_ggml_metal_mul_mat_id_decode_replay_insert_count.store(0);
+    g_ggml_metal_mul_mat_id_decode_replay_clear_count.store(0);
+    g_ggml_metal_mul_mat_id_decode_icb_exec_count.store(0);
+    g_ggml_metal_mul_mat_id_decode_icb_build_fail_count.store(0);
+
+    std::lock_guard<std::mutex> lock(g_ggml_metal_mul_mat_id_decode_replay_mutex);
+    g_ggml_metal_mul_mat_id_decode_replay_cache.clear();
 }
 
 struct ggml_metal_op {
@@ -962,6 +1392,9 @@ static void ggml_metal_encode_mul_mat_id_decode_mv(
         /*.nr0  =*/ nr0,
         /*.r2   =*/ r2,
         /*.r3   =*/ r3,
+        /*.src0_byte_off =*/ 0,
+        /*.src1_byte_off =*/ 0,
+        /*.dst_byte_off  =*/ 0,
     };
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
@@ -993,6 +1426,79 @@ static void ggml_metal_encode_mul_mat_id_decode_mv(
             ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), 1, 1, 32, nsg, 1);
         }
     }
+}
+
+static void ggml_metal_encode_mul_mat_id_decode_mv_replay(
+        ggml_metal_op_t ctx,
+        const ggml_tensor * op,
+        const ggml_metal_mul_mat_id_decode_replay_entry & entry) {
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+    ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(ctx->lib, op);
+    ggml_metal_kargs_mul_mv args = entry.args;
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, entry.smem, 0);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+
+    for (int idx_exp = 0; idx_exp < entry.n_experts; ++idx_exp) {
+        ggml_metal_buffer_id bid_src0_cur = bid_src0;
+        ggml_metal_buffer_id bid_src1_cur = bid_src1;
+        ggml_metal_buffer_id bid_dst_cur  = bid_dst;
+
+        bid_src0_cur.offs += entry.src0_offsets[idx_exp];
+        bid_src1_cur.offs += entry.src1_offsets[idx_exp];
+        bid_dst_cur.offs  += entry.dst_offsets[idx_exp];
+
+        ggml_metal_encoder_set_buffer(enc, bid_src0_cur, 1);
+        ggml_metal_encoder_set_buffer(enc, bid_src1_cur, 2);
+        ggml_metal_encoder_set_buffer(enc, bid_dst_cur,  3);
+        ggml_metal_encoder_dispatch_threadgroups(enc, entry.tg0, 1, 1, entry.tptg0, entry.tptg1, 1);
+    }
+}
+
+static bool ggml_metal_encode_mul_mat_id_decode_mv_icb(
+        ggml_metal_op_t ctx,
+        const ggml_tensor * op,
+        const ggml_metal_mul_mat_id_decode_replay_entry & entry) {
+    if (entry.icb == nullptr) {
+        return false;
+    }
+
+    const ggml_metal_buffer_id bid_args = ggml_metal_owned_buffer_get_id(entry.args_buffer);
+    const ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+    const ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+    const ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+    std::array<std::pair<ggml_metal_buffer_id, uint32_t>, 4> resources = {{
+        { bid_args, GGML_METAL_RESOURCE_USAGE_READ },
+        { bid_src0, GGML_METAL_RESOURCE_USAGE_READ },
+        { bid_src1, GGML_METAL_RESOURCE_USAGE_READ },
+        { bid_dst,  GGML_METAL_RESOURCE_USAGE_WRITE },
+    }};
+
+    for (size_t i = 0; i < resources.size(); ++i) {
+        if (resources[i].first.metal == nullptr || resources[i].second == 0) {
+            continue;
+        }
+
+        for (size_t j = i + 1; j < resources.size(); ++j) {
+            if (resources[i].first.metal == resources[j].first.metal) {
+                resources[i].second |= resources[j].second;
+                resources[j].second = 0;
+            }
+        }
+
+        ggml_metal_encoder_use_resource(ctx->enc, resources[i].first, resources[i].second);
+    }
+
+    ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, entry.smem, 0);
+    ggml_metal_encoder_set_pipeline(ctx->enc, ggml_metal_library_get_pipeline_mul_mv(ctx->lib, op));
+    return ggml_metal_encoder_execute_icb(ctx->enc, entry.icb, size_t(entry.n_experts));
 }
 
 static bool ggml_metal_encode_mul_mat_id_decode_mv_pair(
@@ -1051,6 +1557,9 @@ static bool ggml_metal_encode_mul_mat_id_decode_mv_pair(
         /*.nr0  =*/ nr0,
         /*.r2   =*/ r2,
         /*.r3   =*/ r3,
+        /*.src0_byte_off =*/ 0,
+        /*.src1_byte_off =*/ 0,
+        /*.dst_byte_off  =*/ 0,
     };
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
@@ -3142,6 +3651,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.nr0  =*/ nr0,
             /*.r2   =*/ r2,
             /*.r3   =*/ r3,
+            /*.src0_byte_off =*/ 0,
+            /*.src1_byte_off =*/ 0,
+            /*.dst_byte_off  =*/ 0,
         };
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -3270,7 +3782,29 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ctx->skip_node(pair_gate_up_plan.peer_local_idx);
             } else {
                 g_ggml_metal_mul_mat_id_decode_mv_count.fetch_add(1);
-                ggml_metal_encode_mul_mat_id_decode_mv(ctx, op, expert_ids.data(), ne20);
+                const bool allow_replay =
+                        ggml_metal_mul_mat_id_experimental_decode_replay_enabled() &&
+                        !can_fuse_split_glu &&
+                        !can_fuse_glu;
+                if (allow_replay) {
+                    const bool allow_icb =
+                            ggml_metal_mul_mat_id_experimental_decode_icb_enabled() &&
+                            ctx->use_concurrency;
+                    std::shared_ptr<const ggml_metal_mul_mat_id_decode_replay_entry> replay_entry;
+                    const bool replay_hit =
+                            ggml_metal_mul_mat_id_decode_replay_lookup(ctx->dev, ctx->lib, op, expert_ids.data(), ne20, allow_icb, replay_entry);
+                    if (replay_hit) {
+                        if (allow_icb && ggml_metal_encode_mul_mat_id_decode_mv_icb(ctx, op, *replay_entry)) {
+                            g_ggml_metal_mul_mat_id_decode_icb_exec_count.fetch_add(1);
+                        } else {
+                            ggml_metal_encode_mul_mat_id_decode_mv_replay(ctx, op, *replay_entry);
+                        }
+                    } else {
+                        ggml_metal_encode_mul_mat_id_decode_mv(ctx, op, expert_ids.data(), ne20);
+                    }
+                } else {
+                    ggml_metal_encode_mul_mat_id_decode_mv(ctx, op, expert_ids.data(), ne20);
+                }
             }
 
             if (can_fuse_split_glu) {

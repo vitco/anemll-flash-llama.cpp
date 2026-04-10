@@ -9,10 +9,10 @@ These tools implement the first Flash-MoE GGUF workflow for the vendored `llama.
 - support both a resident packed-bank path and an experimental streamed slot-bank path
 - estimate persistent-bank cost and coverage from exact sidecar bytes plus `--moe-trace` output
 
-By default, the helper scripts keep generated sidecars outside the repo under `/Users/anemll/Models/flash`.
+By default, the helper scripts keep generated sidecars outside the repo under `~/Models/flash`.
 Override that root with `FLASH_ROOT=/some/other/path` or set `SIDECAR_DIR` directly.
 
-Modeling workflow: [`docs/moe-bank-modeling-workflow.md`](/Users/anemll/SourceRelease/GITHUB/ML_playground/mlx-flash-moe/docs/moe-bank-modeling-workflow.md)
+Modeling workflow: [`docs/moe-bank-modeling-workflow.md`](../../docs/moe-bank-modeling-workflow.md)
 
 ## Model index
 
@@ -44,8 +44,8 @@ Per-model extract + run recipes in this document:
 ```bash
 PYTHON=python3 \
 ./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
-  --model /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
-  --out-dir /Users/anemll/Models/flash/qwen35
+  --model ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  --out-dir ~/Models/flash/qwen35
 ```
 
 ## Extract a Gemma4-26B-A4B sidecar
@@ -53,8 +53,8 @@ PYTHON=python3 \
 ```bash
 PYTHON=python3 \
 ./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
-  --model /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
-  --out-dir /Users/anemll/Models/gemma4/packed_experts \
+  --model ~/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
+  --out-dir ~/Models/gemma4/packed_experts \
   --force
 ```
 
@@ -66,8 +66,8 @@ The extractor walks the 6 GGUF shards automatically — point it at the first sh
 ```bash
 PYTHON=python3 \
 ./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
-  --model /Users/anemll/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
-  --out-dir /Users/anemll/Models/flash/GLM-5.1-sidecar
+  --model ~/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
+  --out-dir ~/Models/flash/GLM-5.1-sidecar
 ```
 
 The sidecar is roughly 177 GiB at IQ1_M/IQ2_XXS (76 MoE layers × 256 experts × gate/up/down). Make sure the target SSD has the room.
@@ -85,28 +85,30 @@ This path is currently experimental:
 
 Keep the original GGUF shards until you have verified that the dense GGUF + sidecar pair loads correctly on your machine.
 
+Use `--perf` when comparing the compact dense GGUF against the original full GGUF shards. In this fork, `--perf` prints the standard libllama timing summary including `load time`, so it is the easiest way to confirm that `model-dense.gguf` reduces startup cost. On Flash-MoE `slot-bank` runs it also prints the routed profile table, cached expert hit rate, and Metal replay cache hit rate.
+
 GLM-5.1 example:
 
 ```bash
 python3 ../local_tools/export_dense_gguf.py \
-  --model /Users/anemll/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
-  --sidecar /Users/anemll/Models/flash/GLM-5.1-sidecar \
-  --out-dir /Users/anemll/Models/GLM/GLM-5.1-IQ1-Dense \
+  --model ~/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
+  --sidecar ~/Models/flash/GLM-5.1-sidecar \
+  --out-dir ~/Models/GLM/GLM-5.1-IQ1-Dense \
   --force
 ```
 
 Output:
 
-- `/Users/anemll/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf`
-- `/Users/anemll/Models/GLM/GLM-5.1-IQ1-Dense/flashmoe-package.json`
+- `~/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf`
+- `~/Models/GLM/GLM-5.1-IQ1-Dense/flashmoe-package.json`
 
 Run the compact dense GGUF with the same sidecar:
 
 ```bash
 ./build/bin/llama-cli \
-  -m /Users/anemll/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf \
+  -m ~/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf \
   --moe-mode slot-bank \
-  --moe-sidecar /Users/anemll/Models/flash/GLM-5.1-sidecar \
+  --moe-sidecar ~/Models/flash/GLM-5.1-sidecar \
   --moe-slot-bank 64 \
   --moe-topk 4 \
   -fit on \
@@ -122,13 +124,13 @@ Compared with the full GLM shard set, the compact dense GGUF is about 14 GiB on 
 
 ## Run GLM-5.1 with the sidecar
 
-Daily-driver slot-bank recipe (mirrors the Kimi K2.5 fast-path: `--moe-prefetch-temporal`, `-b 64`, `-ub 1`, `--no-warmup`):
+Portable slot-bank recipe:
 
 ```bash
 ./build/bin/llama-cli \
-  -m /Users/anemll/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
+  -m ~/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
   --moe-mode slot-bank \
-  --moe-sidecar /Users/anemll/Models/flash/GLM-5.1-sidecar \
+  --moe-sidecar ~/Models/flash/GLM-5.1-sidecar \
   --moe-slot-bank 64 \
   --moe-topk 4 \
   --moe-prefetch-temporal \
@@ -142,12 +144,47 @@ Daily-driver slot-bank recipe (mirrors the Kimi K2.5 fast-path: `--moe-prefetch-
   -n 128 -st
 ```
 
+Fast path on this branch for the current best GLM decode throughput on Apple Silicon (M5 MAX):
+
+- export `model-dense.gguf` first and run the dense-only GGUF plus sidecar pair
+- keep `--moe-predict-prev-token` off
+- enable Metal replay plus CPU-visible slot writes
+- use a larger slot bank such as `90` or `96`
+- use `--perf` so you can confirm `load time`, routed source time, and cached expert hit rate
+
+The recipe below is the end-user path we used to reproduce about `6.5` to `6.7 tok/s` on an M5 Max 128 GB with GLM-5.1 IQ1_M:
+
+```bash
+LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_SLOT_DECODE=1 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_REPLAY=1 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_REPLAY_CACHE_LIMIT=65536 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_ICB=0 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=1 \
+./build/bin/llama-cli --perf \
+  -m ~/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar ~/Models/flash/GLM-5.1-sidecar \
+  --moe-slot-bank 90 \
+  --moe-topk 4 \
+  --moe-cache-io-split 4 \
+  -fit on \
+  -ub 1 -b 64 \
+  -ngl 999 \
+  -c 4096 \
+  --seed 123 --temp 0 \
+  -p "Create game of Space Invaders in Swift" \
+  -n 600 -st
+```
+
+If you have the memory headroom, `--moe-slot-bank 96` can be slightly better than `90`, but the gain is small compared with the extra reserve.
+
 GLM-5.1 specific notes:
 
 - **`--moe-topk 4`** is a reduction-only override of the model's native K=8. On IQ1_M/IQ2_XXS quants the K=4 vs K=8 quality gap is within noise for general use, while halving per-token expert I/O for ~2× decode. Drop the flag to use native K=8 if you need maximum fidelity.
 - **`--moe-slot-bank 64`** is the starting point. With native K=8 the bank has only 8× headroom; if you have RAM, try `128` or `256` for higher reuse on warm caches.
 - **`--moe-prefetch-temporal`** is the single biggest knob — it overlaps next-layer expert `pread`s with current-layer GPU compute. Always on for SSD-bound MoE.
-- **DSA indexer overhead is structural.** GLM has 79 layers (vs Kimi 61) plus a per-layer sparse-attention indexer that K2.5 doesn't have. Decode is part SSD-bound, part dense-compute-bound — ~3.9 tok/s on M5 Max 128 GB is the current realistic ceiling without quant-kernel work for IQ1_M/IQ2_XXS `mul_mat_id`.
+- **`--perf`** is recommended for tuning. It prints `load time` for dense-vs-full-GGUF comparisons, and on `slot-bank` runs it also prints the Flash-MoE routed breakdown (`Expert I/O source`, `Expert upload`), cached expert hit rate, and Metal replay cache hit rate.
+- **The best-known fast path on this branch is higher than the older baseline.** With dense-only export, Metal replay, CPU-visible slot writes, predictor off, and a `90` to `96` slot bank, GLM-5.1 IQ1_M is currently landing around `6.5` to `6.7 tok/s` on M5 Max 128 GB steady-state runs. Older full-GGUF or smaller-bank recipes remain useful as simpler baselines.
 - If you hit hangs or memory pressure (the DSV2/Kimi GPU-bank path is shared with GLM), fall back with:
   ```bash
   LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1 ./build/bin/llama-cli ...
@@ -158,8 +195,8 @@ GLM-5.1 specific notes:
 ```bash
 PYTHON=python3 \
 ./tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
-  --model /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
-  --sidecar /Users/anemll/Models/flash/qwen35
+  --model ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  --sidecar ~/Models/flash/qwen35
 ```
 
 Gemma4 verification uses the same command shape:
@@ -167,8 +204,8 @@ Gemma4 verification uses the same command shape:
 ```bash
 PYTHON=python3 \
 ./tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
-  --model /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
-  --sidecar /Users/anemll/Models/gemma4/packed_experts
+  --model ~/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
+  --sidecar ~/Models/gemma4/packed_experts
 ```
 
 ## Inspect a model or subset
@@ -176,7 +213,7 @@ PYTHON=python3 \
 ```bash
 PYTHON=python3 \
 ./tools/flashmoe-sidecar/flashmoe_sidecar.py inspect \
-  --model /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
+  --model ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --layers 1-2 \
   --families routed \
   --include-shared
@@ -187,8 +224,8 @@ PYTHON=python3 \
 ```bash
 PYTHON=python3 \
 ./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
-  --model /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
-  --out-dir /Users/anemll/Models/flash/kimi-layer1 \
+  --model ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
+  --out-dir ~/Models/flash/kimi-layer1 \
   --layers 1 \
   --families all \
   --include-shared
@@ -198,7 +235,7 @@ PYTHON=python3 \
 
 ```bash
 python3 ./tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
-  --sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
+  --sidecar ~/Models/flash/Kimi-K2.5-sidecar \
   --trace /tmp/kimi-k25-trace.jsonl \
   --banks 4 --banks 8 --banks 16 --banks 32 --banks 64 \
   --byte-budget-gib 8 --byte-budget-gib 16 --byte-budget-gib 24 --byte-budget-gib 32
@@ -208,8 +245,8 @@ Live terminal dashboard:
 
 ```bash
 python3 ./tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
-  --sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
-  --trace /Users/anemll/Models/flash/logs/kimi-k25-1h-trace.jsonl \
+  --sidecar ~/Models/flash/Kimi-K2.5-sidecar \
+  --trace ~/Models/flash/logs/kimi-k25-1h-trace.jsonl \
   --banks 4 --banks 16 --banks 64 \
   --byte-budget-gib 64 --byte-budget-gib 72 --byte-budget-gib 96 \
   --watch 20
@@ -219,22 +256,22 @@ Optional dashboard export:
 
 ```bash
 python3 ./tools/flashmoe-sidecar/flashmoe_cache_estimator.py \
-  --sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
+  --sidecar ~/Models/flash/Kimi-K2.5-sidecar \
   --trace /tmp/kimi-k25-trace.jsonl \
   --banks 4 --banks 16 --banks 64 \
   --byte-budget-gib 64 --byte-budget-gib 72 --byte-budget-gib 96 \
-  --svg-out /Users/anemll/Models/flash/logs/kimi-k25-cache-dashboard.svg
+  --svg-out ~/Models/flash/logs/kimi-k25-cache-dashboard.svg
 ```
 
 Long Kimi trace run without the normal `llama-cli` chat-loop exit:
 
 ```bash
-mkdir -p /Users/anemll/Models/flash/logs
+mkdir -p ~/Models/flash/logs
 
 nohup ./build/bin/llama-cli \
-  -m /Users/anemll/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
+  -m ~/Models/Kimi/Kimi-K2.5-UD-TQ1_0-00001-of-00005.gguf \
   --moe-mode slot-bank \
-  --moe-sidecar /Users/anemll/Models/flash/Kimi-K2.5-sidecar \
+  --moe-sidecar ~/Models/flash/Kimi-K2.5-sidecar \
   --moe-slot-bank 64 \
   --moe-topk 4 \
   --moe-prefetch-temporal \
@@ -247,10 +284,10 @@ nohup ./build/bin/llama-cli \
   --context-shift \
   --seed 123 --temp 0 \
   --ignore-eos \
-  --moe-trace /Users/anemll/Models/flash/logs/kimi-k25-1h-trace.jsonl \
+  --moe-trace ~/Models/flash/logs/kimi-k25-1h-trace.jsonl \
   -p "What is Apple Neural Engine?" \
   -n 12000 \
-  > /Users/anemll/Models/flash/logs/kimi-k25-1h-trace.log 2>&1 &
+  > ~/Models/flash/logs/kimi-k25-1h-trace.log 2>&1 &
 ```
 
 The default build includes `-DLLAMA_FLASH_MOE_GPU_BANK=ON`, and Kimi/DeepSeek2 GPU-bank placement is enabled by default at runtime.
@@ -263,9 +300,9 @@ Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-back
 
 ```bash
 ./build/bin/llama-cli \
-  -m /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  -m ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --moe-mode resident-bank \
-  --moe-sidecar /Users/anemll/Models/flash/qwen35 \
+  --moe-sidecar ~/Models/flash/qwen35 \
   --moe-topk 4 \
   --moe-verify-sidecar \
   --seed 123 --temp 0 \
@@ -277,9 +314,9 @@ Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-back
 
 ```bash
 ./build/bin/llama-cli \
-  -m /Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
+  -m ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --moe-mode slot-bank \
-  --moe-sidecar /Users/anemll/Models/flash/qwen35 \
+  --moe-sidecar ~/Models/flash/qwen35 \
   --moe-slot-bank 32 \
   --moe-topk 4 \
   --moe-prefetch-temporal \
@@ -299,9 +336,9 @@ Resident-bank smoke test:
 ```bash
 ./build/bin/llama-cli \
   --color off --simple-io \
-  -m /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
+  -m ~/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
   --moe-mode resident-bank \
-  --moe-sidecar /Users/anemll/Models/gemma4/packed_experts \
+  --moe-sidecar ~/Models/gemma4/packed_experts \
   --moe-topk 4 \
   -cnv -st -fit on \
   -ub 1 -b 1 -ngl 0 -c 4096 --seed 0 --temp 0 \
@@ -314,9 +351,9 @@ Streamed slot-bank smoke test:
 ```bash
 ./build/bin/llama-cli \
   --color off --simple-io \
-  -m /Users/anemll/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
+  -m ~/Models/gemma4/gemma-4-26B-A4B-it-UD-IQ1_M.gguf \
   --moe-mode slot-bank \
-  --moe-sidecar /Users/anemll/Models/gemma4/packed_experts \
+  --moe-sidecar ~/Models/gemma4/packed_experts \
   --moe-slot-bank 16 \
   --moe-topk 4 \
   --moe-prefetch-temporal \

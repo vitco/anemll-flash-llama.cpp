@@ -3257,6 +3257,11 @@ static inline void helper_mv_reduce_and_write(
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 
+#define GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst) \
+    src0 += args.src0_byte_off; \
+    src1 += args.src1_byte_off; \
+    dst  += args.dst_byte_off
+
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
         args_t args,
@@ -3267,6 +3272,8 @@ void mul_vec_q_n_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     constexpr short NW = N_SIMDWIDTH;
@@ -3403,6 +3410,8 @@ void kernel_mul_mv_q8_0_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     constexpr short NW = N_SIMDWIDTH;
@@ -3807,6 +3816,8 @@ void kernel_mul_mv_t_t_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     constexpr short NW = N_SIMDWIDTH;
@@ -3928,6 +3939,8 @@ void kernel_mul_mv_t_t_4_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     constexpr short NW = N_SIMDWIDTH;
@@ -4050,6 +4063,8 @@ void kernel_mul_mv_t_t_short_impl(
         device       char * dst,
         uint3  tgpig,
         ushort tiisg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const int r0 = tgpig.x*32 + tiisg;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
@@ -7123,6 +7138,8 @@ void kernel_mul_mv_q2_K_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -7228,6 +7245,8 @@ void kernel_mul_mv_q3_K_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -7393,6 +7412,8 @@ void kernel_mul_mv_q4_K_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     constexpr uint16_t kmask1 = 0x3f3f;
@@ -7514,6 +7535,8 @@ void kernel_mul_mv_q5_K_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -7645,6 +7668,8 @@ void kernel_mul_mv_q6_K_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     constexpr uint8_t kmask1 = 0x03;
@@ -7755,6 +7780,8 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -7995,6 +8022,8 @@ void kernel_mul_mv_iq2_xs_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -8114,6 +8143,8 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -8364,6 +8395,8 @@ void kernel_mul_mv_iq3_s_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -8476,6 +8509,8 @@ void kernel_mul_mv_iq2_s_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -8589,6 +8624,8 @@ void kernel_mul_mv_iq1_s_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -8688,6 +8725,8 @@ void kernel_mul_mv_iq1_m_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     const int nb = args.ne00/QK_K;
@@ -8797,6 +8836,8 @@ void kernel_mul_mv_iq4_nl_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     threadgroup float * shmem_f32 = (threadgroup float *) shmem;
@@ -8907,6 +8948,8 @@ void kernel_mul_mv_iq4_xs_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     threadgroup float * shmem_f32 = (threadgroup float *) shmem;
@@ -9017,6 +9060,8 @@ void kernel_mul_mv_mxfp4_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
     const short NSG = FC_mul_mv_nsg;
 
     threadgroup float * shmem_f32 = (threadgroup float *) shmem;

@@ -787,6 +787,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  topk-override    = %d\n", params.moe_topk_override);
         fprintf(stderr, "  cache-io-split   = %d\n", params.moe_cache_io_split);
         fprintf(stderr, "  prefetch-temporal = %s\n", params.moe_prefetch_temporal ? "on" : "off");
+        fprintf(stderr, "  predict-prev-token = %s\n", params.moe_predict_prev_token ? "on" : "off");
+        fprintf(stderr, "  predict-top1-prev = %s\n", params.moe_predict_top1_prev ? "on" : "off");
         fprintf(stderr, "  shared-only      = %s\n", params.moe_shared_only ? "on" : "off");
         fprintf(stderr, "  trace-harness    = %s\n", params.moe_trace_harness ? "on" : "off");
         fprintf(stderr, "  n_gpu_layers     = %d\n", params.n_gpu_layers);

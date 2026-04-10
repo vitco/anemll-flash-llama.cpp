@@ -466,6 +466,8 @@ struct llama_model::impl {
     bool flash_moe_oracle_all_hit_enabled = false;
     bool flash_moe_oracle_prefetch_enabled = false;
     bool flash_moe_temporal_prefetch_enabled = false;
+    bool flash_moe_predict_prev_token_enabled = false;
+    bool flash_moe_predict_top1_prev_enabled = false;
     int32_t flash_moe_slot_bank_size = 0;
     int32_t flash_moe_cache_io_split = 4;
     int32_t moe_n_expert_used = 0;
@@ -549,6 +551,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->flash_moe_oracle_all_hit_enabled = llama_flash_moe_mode_is(params, "oracle-all-hit");
     pimpl->flash_moe_oracle_prefetch_enabled = llama_flash_moe_mode_is(params, "oracle-prefetch");
     pimpl->flash_moe_temporal_prefetch_enabled = params.moe_prefetch_temporal;
+    pimpl->flash_moe_predict_prev_token_enabled = params.moe_predict_prev_token;
+    pimpl->flash_moe_predict_top1_prev_enabled = params.moe_predict_top1_prev;
     pimpl->flash_moe_cache_io_split = std::max<int32_t>(1, params.moe_cache_io_split);
     pimpl->flash_moe_slot_bank_enabled = llama_flash_moe_mode_is(params, "slot-bank") ||
             pimpl->flash_moe_resident_source_enabled ||
@@ -8663,6 +8667,14 @@ bool llama_model::flash_moe_temporal_prefetch_enabled() const {
     return pimpl->flash_moe_temporal_prefetch_enabled;
 }
 
+bool llama_model::flash_moe_predict_prev_token_enabled() const {
+    return pimpl->flash_moe_predict_prev_token_enabled;
+}
+
+bool llama_model::flash_moe_predict_top1_prev_enabled() const {
+    return pimpl->flash_moe_predict_top1_prev_enabled;
+}
+
 int32_t llama_model::flash_moe_slot_bank_size() const {
     return pimpl->flash_moe_slot_bank_size;
 }
@@ -9411,6 +9423,8 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.moe_verify_sidecar          =*/ false,
         /*.moe_prefetch_temporal       =*/ false,
+        /*.moe_predict_prev_token      =*/ false,
+        /*.moe_predict_top1_prev       =*/ false,
         /*.moe_slot_bank               =*/ 0,
         /*.moe_topk_override           =*/ 0,
         /*.moe_cache_io_split          =*/ 4,
