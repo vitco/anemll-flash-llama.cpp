@@ -121,6 +121,7 @@ struct llama_model_loader {
     size_t flash_moe_virtualized_bytes               = 0;
     size_t flash_moe_filtered_load_tensors           = 0;
     size_t flash_moe_filtered_load_bytes             = 0;
+    size_t flash_moe_synthetic_virtual_tensors       = 0;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;

@@ -1354,6 +1354,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_quant_map      = params.moe_quant_map.empty() ? nullptr : params.moe_quant_map.c_str();
     mparams.moe_verify_sidecar = params.moe_verify_sidecar;
     mparams.moe_prefetch_temporal = params.moe_prefetch_temporal;
+    mparams.moe_predict_prev_token = params.moe_predict_prev_token;
+    mparams.moe_predict_top1_prev = params.moe_predict_top1_prev;
     mparams.moe_slot_bank      = params.moe_slot_bank;
     mparams.moe_topk_override  = params.moe_topk_override;
     mparams.moe_cache_io_split = params.moe_cache_io_split;

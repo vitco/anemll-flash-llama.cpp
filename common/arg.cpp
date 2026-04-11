@@ -2274,7 +2274,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_TOPK"));
     add_opt(common_arg(
         {"--moe-cache-io-split"}, "N",
-        "split each routed expert pread into N page-aligned chunks during slot-bank installs (1 = disabled, 4 is a good 397B starting point)",
+        "split each routed expert pread into N page-aligned chunks during slot-bank installs (1 = disabled; default: 4)",
         [](common_params & params, int value) {
             if (value < 1) {
                 throw std::invalid_argument("invalid value");
@@ -2300,6 +2300,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_prefetch_temporal = value;
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH_TEMPORAL"));
+    add_opt(common_arg(
+        {"--moe-predict-prev-token"},
+        {"--no-moe-predict-prev-token"},
+        string_format("enable previous-token same-layer expert prediction for slot-bank decode (default: %s)", params.moe_predict_prev_token ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_predict_prev_token = value;
+            if (value) {
+                params.moe_predict_top1_prev = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREDICT_PREV_TOKEN"));
+    add_opt(common_arg(
+        {"--moe-predict-top1-prev"},
+        {"--no-moe-predict-top1-prev"},
+        string_format("enable previous-token top-1 same-layer expert prediction for slot-bank decode (default: %s)", params.moe_predict_top1_prev ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_predict_top1_prev = value;
+            if (value) {
+                params.moe_predict_prev_token = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREDICT_TOP1_PREV"));
     add_opt(common_arg(
         {"--moe-shared-only"},
         {"--no-moe-shared-only"},

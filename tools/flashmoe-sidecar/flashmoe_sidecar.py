@@ -21,6 +21,7 @@ ROUTED_FAMILIES = {
     "ffn_gate_exps",
     "ffn_up_exps",
     "ffn_down_exps",
+    "ffn_gate_up_exps",  # gemma4: fused gate+up
 }
 
 SHARED_FAMILIES = {
@@ -33,9 +34,10 @@ FAMILY_ORDER = {
     "ffn_gate_exps": 0,
     "ffn_up_exps": 1,
     "ffn_down_exps": 2,
-    "ffn_gate_shexp": 3,
-    "ffn_up_shexp": 4,
-    "ffn_down_shexp": 5,
+    "ffn_gate_up_exps": 3,  # gemma4: fused gate+up
+    "ffn_gate_shexp": 4,
+    "ffn_up_shexp": 5,
+    "ffn_down_shexp": 6,
 }
 
 LAYER_TENSOR_RE = re.compile(r"^blk\.(\d+)\.(ffn_[^.]+)\.weight$")
@@ -230,6 +232,9 @@ def build_tensor_index(
             bytes_per_expert = None
             if len(shape) >= 3 and shape[2] > 0 and tensor.n_bytes % shape[2] == 0:
                 bytes_per_expert = tensor.n_bytes // shape[2]
+            elif len(shape) == 1 and expert_count > 0 and tensor.n_bytes % expert_count == 0:
+                # 1D per-expert tensors (e.g. ffn_down_exps.scale)
+                bytes_per_expert = tensor.n_bytes // expert_count
 
             tensors[tensor.name] = {
                 "layer": layer,

@@ -12,7 +12,7 @@ if [[ -x "${PYTHON_DEFAULT}" ]]; then
 fi
 
 MODEL="${MODEL:-/Users/anemll/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf}"
-BUILD_DIR="${BUILD_DIR:-${LLAMA_DIR}/build-flashmoe}"
+BUILD_DIR="${BUILD_DIR:-${LLAMA_DIR}/build}"
 RESULTS_DIR="${RESULTS_DIR:-${LLAMA_DIR}/flashmoe-results/qwen35}"
 FLASH_ROOT="${FLASH_ROOT:-/Users/anemll/Models/flash}"
 SIDECAR_DIR="${SIDECAR_DIR:-${FLASH_ROOT}/qwen35}"
@@ -73,6 +73,7 @@ if [[ "${ENABLE_SIDECAR}" == "1" ]]; then
     -m "${MODEL}" \
     --moe-mode resident-bank \
     --moe-sidecar "${SIDECAR_DIR}" \
+    --moe-topk 4 \
     --moe-verify-sidecar \
     -r 1 \
     --no-warmup \
@@ -85,6 +86,7 @@ if [[ "${ENABLE_SIDECAR}" == "1" ]]; then
     -m "${MODEL}" \
     --moe-mode resident-bank \
     --moe-sidecar "${SIDECAR_DIR}" \
+    --moe-topk 4 \
     --moe-verify-sidecar \
     --seed 123 \
     --temp 0 \

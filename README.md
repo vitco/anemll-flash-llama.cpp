@@ -10,12 +10,28 @@ Flash-MoE inference for large GGUF Mixture-of-Experts models on Apple Silicon, u
 >
 > Native slot-bank model-porting guide: [docs/native-slot-bank-porting.md](./docs/native-slot-bank-porting.md)
 
+## Quick jump — sidecar extract & run
+
+Per-model extract + run recipes live in [tools/flashmoe-sidecar/README.md](./tools/flashmoe-sidecar/README.md):
+
+| Model | Arch | Status | Extract | Run |
+|---|---|---|---|---|
+| Qwen3.5-35B-A3B | qwen3moe | Stable (anchor) | [Extract](./tools/flashmoe-sidecar/README.md#extract-a-qwen35-sidecar) | [Run](./tools/flashmoe-sidecar/README.md#run-with-the-sidecar) |
+| Qwen3.5-397B-A17B | qwen35moe (linear-attn) | Stable (slot-bank required) | [Extract](./tools/flashmoe-sidecar/README.md#extract-a-qwen35-sidecar) | [Run](./tools/flashmoe-sidecar/README.md#run-with-the-sidecar) |
+| Gemma4-26B-A4B | gemma4 | Stable | [Extract](./tools/flashmoe-sidecar/README.md#extract-a-gemma4-26b-a4b-sidecar) | [Run](./tools/flashmoe-sidecar/README.md#run-gemma4-26b-a4b-with-the-sidecar) |
+| Kimi K2 / K2.5 | deepseek2 (MLA) | Experimental | [Extract](./tools/flashmoe-sidecar/README.md#extract-only-selected-layers) | [Run](./tools/flashmoe-sidecar/README.md#estimate-persistent-bank-cost-and-coverage) |
+| **GLM-5.1 (256×22B)** | **glm-dsa (MLA + DSA indexer)** | **Experimental** | [**Extract**](./tools/flashmoe-sidecar/README.md#extract-a-glm-51-sidecar) | [**Run**](./tools/flashmoe-sidecar/README.md#run-glm-51-with-the-sidecar) |
+
+Build instructions are below; once built, jump to the extract + run recipe for your model.
+
 ## Current Model Support
 
-- `Qwen3.5` GGUF MoE is the current anchor path for bring-up and regression work.
+- **`Qwen3.5` GGUF MoE** is the current anchor path for bring-up and regression work. Stable.
+- **`Gemma4-26B-A4B`** GGUF MoE: stable. Native `n_expert_used = 8`. Sensitive to slot-bank size on smaller-memory machines — start with `--moe-slot-bank 8` or `16`.
+- **`Kimi-K2` and `Kimi-K2.5`** GGUF support is experimental: sidecar extraction, slot-bank runtime, trace capture, and bank modeling work, but quality and performance are still being tuned. Kimi currently requires `-ub 1` for correct output. The `-ngl 99` dense GPU path produces degraded output on some runs due to a Metal compute issue being investigated.
+- **`GLM-5.1` (`glm-dsa`, 256×22B MoE)** is experimental: 79 layers, MLA attention with `q_lora_rank=2048`, DeepSeek-V3-style sigmoid routing (K=8 of 256), shared expert, and a per-layer DSA sparse-attention indexer. Slot-bank streaming works; the DSA indexer adds per-layer dense matmul overhead K2.5 doesn't have, and IQ1_M / IQ2_XXS `mul_mat_id` Metal kernels are not yet on the hot path. Realistic decode on M5 Max 128 GB is currently ~3.9 tok/s with `--moe-topk 4 --moe-prefetch-temporal --moe-slot-bank 64`. Shares the DeepSeek2 GPU-bank fallback path.
 - The recommended build uses `-DLLAMA_FLASH_MOE_GPU_BANK=ON` (the default). In slot-bank mode, routed experts are **not** loaded into GPU memory — they stream from SSD. Use `-ngl 99` to offload dense/shared weights to GPU; the fitter clamps dense/shared placement against the routed slot-bank budget.
-- `Kimi-K2` and `Kimi-K2.5` GGUF support is experimental: sidecar extraction, slot-bank runtime, trace capture, and bank modeling work, but quality and performance are still being tuned. Kimi currently requires `-ub 1` for correct output. The `-ngl 99` dense GPU path produces degraded output on some runs due to a Metal compute issue being investigated.
-- For Kimi/DeepSeek2, GPU-bank placement of routed experts is enabled by default in GPU-bank builds. Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-backed slot-bank path if you hit hangs or memory pressure.
+- For Kimi/DeepSeek2/GLM-5.1, GPU-bank placement of routed experts is enabled by default in GPU-bank builds. Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-backed slot-bank path if you hit hangs or memory pressure.
 
 ## Purpose
 

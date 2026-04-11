@@ -84,12 +84,48 @@ void ggml_metal_encoder_set_bytes (ggml_metal_encoder_t encoder, void * data, si
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx);
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx);
+void ggml_metal_encoder_use_resource(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, uint32_t usage);
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2);
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
+
+typedef struct ggml_metal_owned_buffer * ggml_metal_owned_buffer_t;
+
+ggml_metal_owned_buffer_t ggml_metal_owned_buffer_init(ggml_metal_device_t dev, const void * data, size_t size);
+void ggml_metal_owned_buffer_free(ggml_metal_owned_buffer_t buffer);
+
+struct ggml_metal_buffer_id ggml_metal_owned_buffer_get_id(ggml_metal_owned_buffer_t buffer);
+
+typedef struct ggml_metal_icb * ggml_metal_icb_t;
+
+bool ggml_metal_device_supports_compute_icb(ggml_metal_device_t dev);
+
+ggml_metal_icb_t ggml_metal_icb_compute_init(
+        ggml_metal_device_t dev,
+        size_t max_command_count,
+        size_t max_kernel_buffer_bind_count);
+void ggml_metal_icb_free(ggml_metal_icb_t icb);
+
+bool ggml_metal_icb_encode_compute_dispatch(
+        ggml_metal_icb_t icb,
+        size_t command_index,
+        struct ggml_metal_pipeline_with_params pipeline,
+        struct ggml_metal_buffer_id args,
+        struct ggml_metal_buffer_id src0,
+        struct ggml_metal_buffer_id src1,
+        struct ggml_metal_buffer_id dst,
+        size_t threadgroup_memory_size,
+        int tg0,
+        int tg1,
+        int tg2,
+        int tptg0,
+        int tptg1,
+        int tptg2);
+
+bool ggml_metal_encoder_execute_icb(ggml_metal_encoder_t encoder, ggml_metal_icb_t icb, size_t n_commands);
 
 //
 // MTLLibrary wrapper

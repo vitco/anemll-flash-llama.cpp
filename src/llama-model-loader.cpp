@@ -33,6 +33,12 @@ static bool llama_flash_moe_is_routed_tensor_name(const char * name) {
         return false;
     }
 
+    // Per-expert scale tensors (e.g. ffn_down_exps.scale) are small metadata
+    // that stay in the GGUF — they are not routed expert weight data.
+    if (strstr(name, ".scale") != nullptr) {
+        return false;
+    }
+
     return strstr(name, ".ffn_gate_up_exps.") != nullptr ||
            strstr(name, ".ffn_gate_exps.")    != nullptr ||
            strstr(name, ".ffn_up_exps.")      != nullptr ||
@@ -1326,15 +1332,24 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        auto init_tensor_layout = [](ggml_tensor & tensor, ggml_type type, const auto & dims) {
+            memset(&tensor, 0, sizeof(ggml_tensor));
+            tensor.type = type;
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                tensor.ne[dim] = dim < dims.size() ? dims.begin()[dim] : 1;
+                GGML_ASSERT(tensor.ne[dim] >= 1);
+            }
+            tensor.nb[0] = ggml_type_size(type);
+            tensor.nb[1] = ggml_row_size(type, tensor.ne[0]);
+            GGML_ASSERT(tensor.nb[1] >= 1);
+            for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+                tensor.nb[dim] = tensor.nb[dim - 1] * tensor.ne[dim - 1];
+                GGML_ASSERT(tensor.nb[dim] >= 1);
+            }
+        };
+
         ggml_tensor t_meta;
-        memset(&t_meta, 0, sizeof(ggml_tensor));
-        t_meta.type = type;
-        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
-            GGML_ASSERT(t_meta.ne[dim] >= 1);
-            t_meta.nb[dim] = dim == 0 ? ggml_type_size(type) : t_meta.ne[dim-1]*t_meta.nb[dim-1];
-            GGML_ASSERT(t_meta.nb[dim] >= 1);
-        }
+        init_tensor_layout(t_meta, type, ne);
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -1385,12 +1400,29 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::vector<int64_t> & ne, int flags,
         ggml_type type_override) {
+    auto init_tensor_layout = [](ggml_tensor & tensor, ggml_type type, const auto & dims) {
+        memset(&tensor, 0, sizeof(ggml_tensor));
+        tensor.type = type;
+        for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            tensor.ne[dim] = dim < dims.size() ? dims.begin()[dim] : 1;
+            GGML_ASSERT(tensor.ne[dim] >= 1);
+        }
+        tensor.nb[0] = ggml_type_size(type);
+        tensor.nb[1] = ggml_row_size(type, tensor.ne[0]);
+        GGML_ASSERT(tensor.nb[1] >= 1);
+        for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+            tensor.nb[dim] = tensor.nb[dim - 1] * tensor.ne[dim - 1];
+            GGML_ASSERT(tensor.nb[dim] >= 1);
+        }
+    };
+
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map_virtual.find(buft);
         if (it == ctx_map_virtual.end()) {
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;
             max_n_tensors += hparams.n_layer*2;
+            max_n_tensors += hparams.n_layer*4; // routed expert virtual tensors in compact dense GGUF slot-bank mode
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer*256;
             }
@@ -1535,14 +1567,7 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
 
     if (files.empty()) {
         ggml_tensor t_meta;
-        memset(&t_meta, 0, sizeof(ggml_tensor));
-        t_meta.type = type_override != GGML_TYPE_COUNT ? type_override : GGML_TYPE_F32;
-        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_meta.ne[dim] = dim < ne.size() ? ne[dim] : 1;
-            GGML_ASSERT(t_meta.ne[dim] >= 1);
-            t_meta.nb[dim] = dim == 0 ? ggml_type_size(t_meta.type) : t_meta.ne[dim-1]*t_meta.nb[dim-1];
-            GGML_ASSERT(t_meta.nb[dim] >= 1);
-        }
+        init_tensor_layout(t_meta, type_override != GGML_TYPE_COUNT ? type_override : GGML_TYPE_F32, ne);
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
@@ -1556,15 +1581,15 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
     ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
     ggml_tensor t_buft_meta;
     ggml_tensor * t_buft = t_meta;
-    if (t_meta != nullptr && type_override != GGML_TYPE_COUNT) {
-        memset(&t_buft_meta, 0, sizeof(ggml_tensor));
-        t_buft_meta.type = type_override;
-        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_buft_meta.ne[dim] = dim < ne.size() ? ne[dim] : 1;
-            GGML_ASSERT(t_buft_meta.ne[dim] >= 1);
-            t_buft_meta.nb[dim] = dim == 0 ? ggml_type_size(t_buft_meta.type) : t_buft_meta.ne[dim - 1]*t_buft_meta.nb[dim - 1];
-            GGML_ASSERT(t_buft_meta.nb[dim] >= 1);
-        }
+    const bool synthesize_virtual_meta = t_meta == nullptr && type_override != GGML_TYPE_COUNT;
+    if (synthesize_virtual_meta) {
+        init_tensor_layout(t_buft_meta, type_override, ne);
+        ggml_set_name(&t_buft_meta, tn.str().c_str());
+        t_meta = &t_buft_meta;
+        t_buft = &t_buft_meta;
+        flash_moe_synthetic_virtual_tensors++;
+    } else if (t_meta != nullptr && type_override != GGML_TYPE_COUNT) {
+        init_tensor_layout(t_buft_meta, type_override, ne);
         ggml_set_name(&t_buft_meta, ggml_get_name(t_meta));
         t_buft = &t_buft_meta;
     }
@@ -1587,14 +1612,7 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
     }
 
     ggml_tensor t_virtual;
-    memset(&t_virtual, 0, sizeof(ggml_tensor));
-    t_virtual.type = type_override != GGML_TYPE_COUNT ? type_override : t_meta->type;
-    for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-        t_virtual.ne[dim] = dim < ne.size() ? ne[dim] : 1;
-        GGML_ASSERT(t_virtual.ne[dim] >= 1);
-        t_virtual.nb[dim] = dim == 0 ? ggml_type_size(t_virtual.type) : t_virtual.ne[dim - 1]*t_virtual.nb[dim - 1];
-        GGML_ASSERT(t_virtual.nb[dim] >= 1);
-    }
+    init_tensor_layout(t_virtual, type_override != GGML_TYPE_COUNT ? type_override : t_meta->type, ne);
     ggml_set_name(&t_virtual, ggml_get_name(t_meta));
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_virtual);
@@ -1602,7 +1620,7 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
 
     if (flags & TENSOR_DUPLICATED) {
         size_data += ggml_nbytes(tensor);
-    } else {
+    } else if (!synthesize_virtual_meta) {
         n_created++;
     }
 
@@ -1612,7 +1630,9 @@ struct ggml_tensor * llama_model_loader::create_tensor_virtual(
         flash_moe_virtualized_bytes += ggml_nbytes(tensor);
     }
 
-    weights_map.erase(ggml_get_name(t_meta));
+    if (!synthesize_virtual_meta) {
+        weights_map.erase(ggml_get_name(t_meta));
+    }
 
     return tensor;
 }
@@ -1646,8 +1666,15 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 }
 
 void llama_model_loader::done_getting_tensors() const {
-    if (n_created != n_tensors) {
-        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+    const int n_tensors_max = n_tensors + (int) flash_moe_synthetic_virtual_tensors;
+    if (n_created < n_tensors || n_created > n_tensors_max) {
+        throw std::runtime_error(format(
+                "%s: wrong number of tensors; expected %d..%d, got %d",
+                __func__, n_tensors, n_tensors_max, n_created));
+    }
+    if (flash_moe_synthetic_virtual_tensors > 0 && n_created != n_tensors) {
+        LLAMA_LOG_INFO("%s: compact Flash-MoE dense GGUF created %zu synthetic routed virtual tensors; accepted %d total tensors for %d GGUF-backed weights\n",
+                __func__, flash_moe_synthetic_virtual_tensors, n_created, n_tensors);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",

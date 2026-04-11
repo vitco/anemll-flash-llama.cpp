@@ -276,6 +276,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_norm         = nullptr;
     struct ggml_tensor * ffn_norm_b       = nullptr;
     struct ggml_tensor * ffn_post_norm    = nullptr;
+    struct ggml_tensor * ffn_post_norm_1  = nullptr; // gemma4
+    struct ggml_tensor * ffn_post_norm_2  = nullptr; // gemma4
+    struct ggml_tensor * ffn_pre_norm_2   = nullptr; // gemma4
     struct ggml_tensor * layer_out_norm   = nullptr;
     struct ggml_tensor * layer_out_norm_b = nullptr;
     struct ggml_tensor * ffn_norm_exps    = nullptr;
@@ -291,6 +294,7 @@ struct llama_layer {
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
+    struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
@@ -468,6 +472,9 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // gemma4 layer output scale
+    struct ggml_tensor * out_scale = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -583,6 +590,8 @@ struct llama_model {
     bool flash_moe_oracle_all_hit_enabled() const;
     bool flash_moe_oracle_prefetch_enabled() const;
     bool flash_moe_temporal_prefetch_enabled() const;
+    bool flash_moe_predict_prev_token_enabled() const;
+    bool flash_moe_predict_top1_prev_enabled() const;
     int32_t flash_moe_slot_bank_size() const;
     int32_t flash_moe_cache_io_split() const;
     int32_t moe_n_expert_used() const;
